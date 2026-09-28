@@ -7,4 +7,8 @@ if (!env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
 
 const client = new Database(env.DATABASE_URL);
 
+/** Lets reads proceed against a snapshot while mail sync writes, instead of blocking behind it. */
+client.pragma('journal_mode = WAL');
+client.pragma('busy_timeout = 5000');
+
 export const db = drizzle(client, { schema });

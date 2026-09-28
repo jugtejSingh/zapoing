@@ -1,11 +1,17 @@
-import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
-
-export const task = sqliteTable('task', {
-	id: text('id')
-		.primaryKey()
-		.$defaultFn(() => crypto.randomUUID()),
-	title: text('title').notNull(),
-	priority: integer('priority').notNull().default(1)
-});
-
 export * from './auth.schema';
+
+export * from './mail.schema';
+
+export * from './contact.schema';
+
+export * from './job.schema';
+
+export * from './draft.schema';
+
+export * from './document.schema';
+
+export * from './template.schema';
+
+export * from './generated.schema';
+
+export * from './resource.schema';

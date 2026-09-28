@@ -25,3 +25,6 @@ vite.config.ts.timestamp-*
 test-results
 # SQLite
 *.db
+
+# App data (profile, summaries, logs)
+/data
