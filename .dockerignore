@@ -1,0 +1,14 @@
+node_modules
+.svelte-kit
+build
+.git
+data
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.docker.example
+test-results
+Dockerfile
+docker-compose.yml

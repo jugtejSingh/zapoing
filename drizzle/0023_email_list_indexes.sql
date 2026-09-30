@@ -1,0 +1,2 @@
+CREATE INDEX `email_dir_date_uid_idx` ON `email` (`direction`,`date`,`uid`);--> statement-breakpoint
+CREATE INDEX `email_thread_dir_date_uid_idx` ON `email` (`account_id`,`thread_id`,`direction`,`date`,`uid`);
