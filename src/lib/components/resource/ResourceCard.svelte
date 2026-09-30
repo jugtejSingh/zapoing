@@ -52,18 +52,6 @@
 		<span class="text-muted-foreground ms-auto text-xs">Updated {formatDate(item.updatedAt)}</span>
 	</div>
 
-	{#if item.keywords.length > 0}
-		<p class="text-sm">{item.keywords}</p>
-	{/if}
-
-	{#if item.tags.length > 0}
-		<div class="flex flex-wrap gap-1">
-			{#each item.tags as tag (tag)}
-				<span class="bg-muted rounded px-1.5 text-xs">{tag}</span>
-			{/each}
-		</div>
-	{/if}
-
 	<ResourceIndexStatus {item} />
 
 	<details class="text-sm">
@@ -71,12 +59,7 @@
 
 		<form method="post" action="?/update" use:enhance={submitAction} class="mt-2 grid gap-2">
 			<input type="hidden" name="resourceId" value={item.id} />
-			<ResourceFields
-				idPrefix={item.id}
-				name={item.name}
-				keywords={item.keywords}
-				tags={item.tags.join(', ')}
-			/>
+			<ResourceFields idPrefix={item.id} name={item.name} />
 			<div>
 				<Button type="submit" size="sm" variant="secondary" disabled={busy}>Save</Button>
 			</div>

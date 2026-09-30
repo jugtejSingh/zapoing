@@ -17,6 +17,8 @@ import {
 	markFields,
 	type FieldText
 } from '$lib/server/files/fill/officeXml';
+import { indexedText } from '$lib/server/fileIndex';
+import { readBranding } from '$lib/server/branding';
 import { renderPdf } from '$lib/server/files/render/pdf';
 import { registerJobHandler } from '$lib/server/jobs/worker';
 import {
@@ -48,7 +50,7 @@ ${FIELD_RULES}
 - A text must belong to that field alone: if the same blank is used for different fields, leave it out of text.`;
 
 const PREPARE_PDF_PROMPT = `You find the fields in templates.
-The document is attached.
+The document's text is below.
 Return JSON only, with no code fence: {"fields": [{"name": "counterparty-name", "description": "the other party's company name"}], "markdown": "the whole document"}
 
 ${FIELD_RULES}
@@ -162,16 +164,22 @@ async function prepare(row: TemplateRow): Promise<TemplateField[]> {
 	const markedPath = await templateMarkedPath(row.id, row.format);
 
 	if (row.format === 'pdf') {
-		const file: ModelFile = { filename: row.filename, mime: 'application/pdf', content: original };
+		/** The ingestion job already read the PDF, so this model only needs its text. */
+		const pdfText = await indexedText('template', row.id);
+
+		if (pdfText === null) {
+			throw new Error('The PDF has not been read yet');
+		}
+
 		const raw = await recordAgentRun('template.prepare', null, () => {
-			return callModel(
-				'template',
-				[
-					{ role: 'system', content: PREPARE_PDF_PROMPT },
-					{ role: 'user', content: 'Template: ' + row.name + '\n' + row.description }
-				],
-				[file]
-			);
+			return callModel('template', [
+				{ role: 'system', content: PREPARE_PDF_PROMPT },
+				{
+					role: 'user',
+					content:
+						'Template: ' + row.name + '\n' + row.description + '\n\nThe document:\n' + pdfText
+				}
+			]);
 		});
 		const reply = parsePrepareReply(raw);
 
@@ -388,9 +396,15 @@ export async function generateFromTemplate(
 			filename = cleanName(templateRow.name + ' - ' + owner.contactName) + '.' + format;
 		}
 
+		let agent: 'template' | 'financial' = 'template';
+
+		if (format === 'xlsx') {
+			agent = 'financial';
+		}
+
 		const raw = await recordAgentRun('template.fill', row.id, () => {
 			return callModel(
-				'template',
+				agent,
 				[
 					{ role: 'system', content: FILL_PROMPT },
 					{ role: 'user', content: fillMessage(templateRow, request, draftRow.body, background) }
@@ -413,7 +427,7 @@ export async function generateFromTemplate(
 
 			sourcePath = await generatedFilePath(threadKey, id, 'source.md');
 			await writeFile(sourcePath, source, 'utf8');
-			await writeFile(filePath, await renderPdf(source));
+			await writeFile(filePath, await renderPdf(source, await readBranding()));
 			placeholders = listPlaceholders(source);
 		} else {
 			const filled = await fillFields(await readFile(marked), format, reply.values);
@@ -437,7 +451,8 @@ export async function generateFromTemplate(
 			path: filePath,
 			sourcePath,
 			changeNote: reply.changeNote,
-			placeholders
+			placeholders,
+			sendAsPdf: format === 'docx' && request.deliverAs !== 'docx'
 		});
 	} catch (caught) {
 		console.error('Template fill failed:', caught);
@@ -451,29 +466,6 @@ export async function generateFromTemplate(
 			error: errorText(caught)
 		});
 	}
-}
-
-/** A standard document was asked for but no template fits: nothing is made, the draft says why. */
-export async function recordMissingTemplate(
-	draftRow: DraftForDocuments,
-	request: DocumentRequest
-): Promise<void> {
-	let wanted = 'the document';
-
-	if (request.missingTemplate !== null) {
-		wanted = request.missingTemplate;
-	}
-
-	await db.insert(generatedFile).values({
-		draftId: draftRow.id,
-		change: request.change,
-		filename: cleanName(wanted),
-		format: 'pdf',
-		error:
-			'No template fits "' +
-			wanted +
-			'". Upload one in Settings → Templates, then regenerate the draft.'
-	});
 }
 
 export function registerTemplateAgent(): void {

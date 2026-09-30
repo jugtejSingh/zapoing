@@ -62,8 +62,8 @@
 				{#if file.error !== null}
 					<p class="text-destructive text-xs">Could not make "{file.change}": {file.error}</p>
 				{:else if file.changeNote.length > 0}
-					<details class="text-xs">
-						<summary class="text-muted-foreground cursor-pointer">What changed</summary>
+					<details open class="text-sm">
+						<summary class="cursor-pointer font-medium">What changed</summary>
 						<p class="mt-1 whitespace-pre-wrap">{file.changeNote}</p>
 					</details>
 				{/if}

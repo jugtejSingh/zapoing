@@ -2,7 +2,6 @@ import { error, fail, redirect } from '@sveltejs/kit';
 import {
 	AGENTS,
 	clearApiKey,
-	DEFAULT_BASE_URL,
 	DEFAULT_MODEL,
 	MAX_THREAD_BUDGET_TOKENS,
 	MIN_THREAD_BUDGET_TOKENS,
@@ -33,7 +32,6 @@ export const load: PageServerLoad = async (event) => {
 		settings: modelSettingsView(),
 		agents: [...AGENTS],
 		defaultModel: DEFAULT_MODEL,
-		defaultBaseUrl: DEFAULT_BASE_URL,
 		minBudget: MIN_THREAD_BUDGET_TOKENS,
 		maxBudget: MAX_THREAD_BUDGET_TOKENS
 	};
@@ -55,7 +53,6 @@ export const actions: Actions = {
 		try {
 			await saveModelSettings({
 				apiKey: field(formData, 'apiKey'),
-				baseUrl: field(formData, 'baseUrl'),
 				models,
 				threadBudgetTokens: field(formData, 'threadBudgetTokens')
 			});

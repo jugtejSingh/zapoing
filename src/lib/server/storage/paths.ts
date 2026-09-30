@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { env } from '$env/dynamic/private';
@@ -45,24 +46,37 @@ export function documentDir(documentId: string): string {
 	return path.join(dataDir(), 'attachments', documentId);
 }
 
-/** `attachments/<doc-id>/vN.<ext>`. The extension is reduced to safe characters, else `bin`. */
-export function documentVersionPath(
-	documentId: string,
-	version: number,
+/**
+ * Where a received file is kept: `attachments/<person's email>/<YYYY-MM-DD>/<filename>`,
+ * so a file can be found by who sent it and when. A second file with the same name
+ * on the same day gets " (2)", " (3)"… instead of replacing the first.
+ */
+export async function attachmentFilePath(
+	personEmail: string,
+	receivedAt: Date,
 	filename: string
 ): Promise<string> {
-	let extension = 'bin';
-	const dot = filename.lastIndexOf('.');
+	const day = receivedAt.toISOString().slice(0, 10);
+	const folder = path.join(dataDir(), 'attachments', safeSegment(personEmail), day);
+	const clean = path.basename(filename).replace(/[\\/:*?"<>|\p{Cc}]/gu, '_').slice(0, 150);
+	const dot = clean.lastIndexOf('.');
+	let base = clean;
+	let extension = '';
 
-	if (dot !== -1) {
-		const candidate = filename.slice(dot + 1).toLowerCase();
-
-		if (/^[a-z0-9]{1,10}$/.test(candidate)) {
-			extension = candidate;
-		}
+	if (dot > 0) {
+		base = clean.slice(0, dot);
+		extension = clean.slice(dot);
 	}
 
-	return ensureParent(path.join(documentDir(documentId), 'v' + String(version) + '.' + extension));
+	let candidate = path.join(folder, base + extension);
+	let number = 2;
+
+	while (existsSync(candidate)) {
+		candidate = path.join(folder, base + ' (' + String(number) + ')' + extension);
+		number = number + 1;
+	}
+
+	return ensureParent(candidate);
 }
 
 export function documentMetaPath(documentId: string): Promise<string> {
@@ -142,4 +156,9 @@ export function resourceFilePath(resourceId: string, extension: string): Promise
 /** \`settings/models.json\`: the model settings page. The API key in it is encrypted. */
 export function modelSettingsPath(): string {
 	return path.join(dataDir(), 'settings', 'models.json');
+}
+
+/** The logo for generated documents. One file, named by its type, so a new upload replaces the old one. */
+export function brandingLogoPath(type: 'png' | 'jpg'): Promise<string> {
+	return ensureParent(path.join(dataDir(), 'profile', 'logo.' + type));
 }

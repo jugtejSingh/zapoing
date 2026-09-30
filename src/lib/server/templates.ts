@@ -3,7 +3,7 @@ import { and, asc, eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { template } from '$lib/server/db/schema';
 import { isReadableByAI } from '$lib/server/files/allowlist';
-import { enqueueJob } from '$lib/server/jobs/worker';
+import { forgetIndex, queueIngest } from '$lib/server/fileIndex';
 import { MAX_ATTACHMENT_BYTES } from '$lib/server/smtp';
 import { templateDir, templateOriginalPath } from '$lib/server/storage/paths';
 
@@ -56,7 +56,7 @@ async function saveOriginal(templateId: string, format: TemplateFormat, file: Fi
 	await writeFile(await templateOriginalPath(templateId, format), content);
 }
 
-/** Saves the upload and queues the model call that finds its fields. */
+/** Saves the upload and queues its ingestion; the field-finding job follows once its text is read. */
 export async function createTemplate(
 	userId: string,
 	input: { name: string; description: string; file: File }
@@ -83,7 +83,7 @@ export async function createTemplate(
 		})
 		.returning();
 
-	await enqueueJob('template.prepare', { templateId: id });
+	await queueIngest('template', id);
 
 	return inserted[0];
 }
@@ -156,8 +156,8 @@ export async function replaceTemplateFile(
 		.set({ filename: file.name, format, fields: [], status: 'processing', error: null })
 		.where(eq(template.id, row.id));
 
-	/** ponytail: jobs run one at a time, so a prepare for the old file finishes before this one reads the new. */
-	await enqueueJob('template.prepare', { templateId: row.id });
+	/** The ingest job reads the new file, then queues the field-finding job. */
+	await queueIngest('template', row.id);
 
 	return true;
 }
@@ -171,6 +171,7 @@ export async function deleteTemplate(userId: string, id: string): Promise<boolea
 	}
 
 	await db.delete(template).where(eq(template.id, row.id));
+	await forgetIndex('template', row.id);
 	await rm(templateDir(row.id), { recursive: true, force: true });
 
 	return true;

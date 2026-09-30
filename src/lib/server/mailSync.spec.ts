@@ -20,7 +20,6 @@ import {
 	deliver,
 	expunge,
 	folderOf,
-	relabel,
 	renumber,
 	resetFakeServers,
 	type FakeFolder,
@@ -208,8 +207,8 @@ describe('later syncs', () => {
 		deliver(inbox, { subject: 'New two' });
 		await syncAccount(account);
 
-		/** Bodies come only from 6 on. The second fetch is the flags-only category check on 1–5. */
-		expect(server.fetchLog).toEqual(['6:*', '1:5 changedSince=6']);
+		/** Bodies come only from 6 on. */
+		expect(server.fetchLog).toEqual(['6:*']);
 		expect(await storedUids(account.id, 'INBOX')).toEqual([1, 2, 3, 4, 5, 6, 7]);
 	});
 
@@ -295,60 +294,5 @@ describe('later syncs', () => {
 		const state = await getMailboxState(account.id, 'INBOX');
 		expect(state?.uidValidity).toBe(2);
 		expect(state?.lastUid).toBe(2);
-	});
-});
-
-describe('categories', () => {
-	it('tags each message with its Gmail tab on backfill', async () => {
-		deliver(inbox, { subject: 'Primary', labels: ['\\Inbox'] });
-		deliver(inbox, { subject: 'Promo', labels: ['\\Inbox', '\\CategoryPromotions'] });
-		deliver(inbox, { subject: 'Social', labels: ['\\CategorySocial'] });
-		deliver(inbox, { subject: 'Updates', labels: ['\\CategoryUpdates'] });
-		deliver(inbox, { subject: 'Forums', labels: ['\\CategoryForums'] });
-		deliver(inbox, { subject: 'Not Gmail' });
-
-		await syncAccount(account);
-
-		const categories: Record<string, string | null> = {};
-
-		for (const row of await storedRows(account.id, 'INBOX')) {
-			categories[row.subject] = row.category;
-		}
-
-		expect(categories).toEqual({
-			Primary: null,
-			Promo: 'promotions',
-			Social: 'social',
-			Updates: 'updates',
-			Forums: 'forums',
-			'Not Gmail': null
-		});
-	});
-
-	it('picks up a message moved to another tab, fetching only changed flags', async () => {
-		deliver(inbox, { subject: 'One', labels: ['\\Inbox'] });
-		deliver(inbox, { subject: 'Two', labels: ['\\Inbox'] });
-		await syncAccount(account);
-
-		const modseqBefore = inbox.highestModseq;
-		relabel(inbox, 1, ['\\Inbox', '\\CategoryPromotions']);
-		await syncAccount(account);
-
-		const rows = await storedRows(account.id, 'INBOX');
-		expect(rows[0].category).toBe('promotions');
-		expect(rows[1].category).toBe(null);
-
-		expect(server.fetchLog).toContain('1:2 changedSince=' + String(modseqBefore));
-	});
-
-	it('skips the category refresh on a server without CONDSTORE', async () => {
-		inbox.noModseq = true;
-		deliverMany(inbox, 2);
-		await syncAccount(account);
-		await syncAccount(account);
-
-		for (const entry of server.fetchLog) {
-			expect(entry).not.toContain('changedSince');
-		}
 	});
 });

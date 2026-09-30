@@ -1,10 +1,9 @@
-import { readFile } from 'node:fs/promises';
 import { error } from '@sveltejs/kit';
 import { downloadHeaders } from '$lib/server/attachments';
-import { getOwnedGenerated } from '$lib/server/files/generated';
+import { deliverable, getOwnedGenerated } from '$lib/server/files/generated';
 import type { RequestHandler } from './$types';
 
-/** Downloads a file the document agent made for a draft. */
+/** Downloads a file the document agent made for a draft, as the recipient will get it. */
 export const GET: RequestHandler = async ({ params, locals }) => {
 	if (!locals.user) {
 		error(401, 'Not signed in');
@@ -16,15 +15,16 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		error(404, 'File not found');
 	}
 
-	let content: Buffer;
+	let file: Awaited<ReturnType<typeof deliverable>>;
 
 	try {
-		content = await readFile(generated.path);
-	} catch {
-		error(404, 'File not found');
+		file = await deliverable(generated);
+	} catch (caught) {
+		console.error('Could not prepare the download:', caught);
+		error(500, caught instanceof Error ? caught.message : 'Could not prepare the file');
 	}
 
-	return new Response(new Uint8Array(content), {
-		headers: downloadHeaders(generated.filename, content.length)
+	return new Response(new Uint8Array(file.content), {
+		headers: downloadHeaders(file.filename, file.content.length)
 	});
 };

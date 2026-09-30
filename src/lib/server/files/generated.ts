@@ -5,13 +5,16 @@ import { db } from '$lib/server/db';
 import { document, draft, email, generatedFile, mailAccount } from '$lib/server/db/schema';
 import {
 	addDocumentVersion,
+	findContactDocumentByName,
 	isStoredForContact,
 	sha256Of,
 	writeWorkingCopy,
 	type WorkingKind
 } from '$lib/server/files/documents';
+import { readBranding } from '$lib/server/branding';
 import { fillFields, markersIn } from '$lib/server/files/fill/officeXml';
 import { renderDocx } from '$lib/server/files/render/docx';
+import { docxToPdf } from '$lib/server/files/render/docxToPdf';
 import { renderPdf } from '$lib/server/files/render/pdf';
 import { renderXlsx, type Sheet } from '$lib/server/files/render/xlsx';
 import type { ReplyAttachment } from '$lib/server/smtp';
@@ -53,12 +56,13 @@ export async function listDraftFiles(draftId: string): Promise<DraftFile[]> {
 	for (const row of await rowsFor(draftId)) {
 		result.push({
 			id: row.id,
-			filename: row.filename,
+			filename: deliveredName(row),
 			change: row.change,
 			changeNote: row.changeNote,
 			error: row.error,
 			isNewDocument: row.documentId === null,
-			placeholders: row.placeholders
+			placeholders: row.placeholders,
+			sendAsPdf: row.sendAsPdf
 		});
 	}
 
@@ -232,20 +236,46 @@ export async function keepLatestVersions(draftId: string): Promise<void> {
 	}
 }
 
+/** The name a file goes out under: a Word file marked for PDF is a .pdf. */
+function deliveredName(row: GeneratedRow): string {
+	if (row.format === 'docx' && row.sendAsPdf) {
+		return row.filename.replace(/.docx$/i, '') + '.pdf';
+	}
+
+	return row.filename;
+}
+
+/**
+ * The file as the recipient gets it, and as the draft shows it. A Word file marked for PDF
+ * is converted here, each time, so it always follows the latest edits; the stored file stays
+ * a docx so it can still be edited. Throws when the conversion fails.
+ */
+export async function deliverable(row: GeneratedRow): Promise<ReplyAttachment> {
+	if (row.path === null) {
+		throw new Error('The file was never written');
+	}
+
+	if (row.format === 'docx' && row.sendAsPdf) {
+		return {
+			filename: deliveredName(row),
+			contentType: MIME_BY_FORMAT.pdf,
+			content: await docxToPdf(await readFile(row.path))
+		};
+	}
+
+	return {
+		filename: row.filename,
+		contentType: MIME_BY_FORMAT[row.format],
+		content: await readFile(row.path)
+	};
+}
+
 /** The draft's rendered files, ready to attach to the reply. */
 export async function draftAttachments(draftId: string): Promise<ReplyAttachment[]> {
 	const attachments: ReplyAttachment[] = [];
 
 	for (const row of sendable(await rowsFor(draftId))) {
-		if (row.path === null) {
-			continue;
-		}
-
-		attachments.push({
-			filename: row.filename,
-			contentType: MIME_BY_FORMAT[row.format],
-			content: await readFile(row.path)
-		});
+		attachments.push(await deliverable(row));
 	}
 
 	return attachments;
@@ -290,11 +320,13 @@ async function renderSource(
 		return renderXlsx(JSON.parse(source) as Sheet[]);
 	}
 
+	const branding = await readBranding();
+
 	if (format === 'docx') {
-		return renderDocx(source);
+		return renderDocx(source, branding);
 	}
 
-	return renderPdf(source);
+	return renderPdf(source, branding);
 }
 
 /**
@@ -385,6 +417,10 @@ export async function recordSentFiles(draftId: string): Promise<void> {
 		let documentId = row.documentId;
 
 		if (documentId === null) {
+			documentId = await findContactDocumentByName(owner.contactId, row.filename);
+		}
+
+		if (documentId === null) {
 			const inserted = await db
 				.insert(document)
 				.values({ contactId: owner.contactId, name: row.filename })
@@ -404,6 +440,15 @@ export async function recordSentFiles(draftId: string): Promise<void> {
 		if (row.sourcePath !== null) {
 			const source = await readFile(row.sourcePath, 'utf8');
 			await writeWorkingCopy(documentId, sourceKind(row.sourcePath), source, version);
+		}
+	}
+}
+
+/** Removes the failed rows made since `before`, so a failed attempt leaves nothing on the draft. */
+export async function removeErroredSince(draftId: string, before: Set<string>): Promise<void> {
+	for (const row of await rowsFor(draftId)) {
+		if (row.error !== null && !before.has(row.id)) {
+			await db.delete(generatedFile).where(eq(generatedFile.id, row.id));
 		}
 	}
 }

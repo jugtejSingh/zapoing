@@ -32,6 +32,8 @@ export const generatedFile = sqliteTable(
 		changeNote: text('change_note').notNull().default(''),
 		/** [[fields]] still in the file. The reply can't be sent until they are filled. */
 		placeholders: text('placeholders', { mode: 'json' }).$type<string[]>().notNull().default([]),
+		/** A Word file that goes out as a PDF (converted by LibreOffice); the stored docx stays editable. */
+		sendAsPdf: integer('send_as_pdf', { mode: 'boolean' }).notNull().default(false),
 		error: text('error'),
 		createdAt: integer('created_at', { mode: 'timestamp_ms' })
 			.default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)

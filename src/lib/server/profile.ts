@@ -8,6 +8,13 @@ export type WritingStyle = {
 	phrasesAvoid: string[];
 };
 
+export type BrandingSettings = {
+	font: string;
+	primaryColor: string;
+	headerText: string;
+	footerText: string;
+};
+
 /** Who the user is and how they write. Every drafting prompt is built on top of this. */
 export type UserProfile = {
 	name: string;
@@ -20,6 +27,8 @@ export type UserProfile = {
 	timezone: string;
 	workingHours: string;
 	standingRules: string[];
+	/** The look of the documents the AI makes. The logo is a file, see branding.ts. */
+	branding: BrandingSettings;
 };
 
 export function emptyProfile(): UserProfile {
@@ -33,7 +42,8 @@ export function emptyProfile(): UserProfile {
 		writingStyle: { tone: '', length: '', phrasesUse: [], phrasesAvoid: [] },
 		timezone: '',
 		workingHours: '',
-		standingRules: []
+		standingRules: [],
+		branding: { font: '', primaryColor: '', headerText: '', footerText: '' }
 	};
 }
 
@@ -54,6 +64,7 @@ export async function readProfile(): Promise<UserProfile> {
 	/** Fields added later fall back to the defaults instead of coming back undefined. */
 	Object.assign(profile, stored);
 	profile.writingStyle = Object.assign(emptyProfile().writingStyle, stored.writingStyle);
+	profile.branding = Object.assign(emptyProfile().branding, stored.branding);
 
 	return profile;
 }

@@ -1,12 +1,19 @@
-import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { contact, email, mailAccount, thread } from '$lib/server/db/schema';
+import { yieldToEventLoop } from '$lib/server/eventLoop';
 import { enqueueJob } from '$lib/server/jobs/worker';
 import { bareAddresses } from '$lib/server/replyAddresses';
 import type { PersonEmailPage } from '$lib/types';
 
 type EmailRow = typeof email.$inferSelect;
 type ContactRow = typeof contact.$inferSelect;
+
+/** Rows per query while scanning a person's mail. Small so no single query holds the server for long. */
+const SCAN_CHUNK_SIZE = 500;
+
+/** Matched emails loaded in full per query. */
+const FULL_ROW_CHUNK_SIZE = 100;
 
 export type MemoryUpdatePayload = {
 	contactId: string;
@@ -38,7 +45,10 @@ async function upsertThread(row: EmailRow): Promise<void> {
 }
 
 /** The tracked contacts whose address appears in the from/to/cc of `row`. */
-function matchingContacts(row: EmailRow, tracked: ContactRow[]): ContactRow[] {
+function matchingContacts(
+	row: Pick<EmailRow, 'from' | 'to' | 'cc'>,
+	tracked: ContactRow[]
+): ContactRow[] {
 	const addresses = new Set<string>();
 
 	for (const address of bareAddresses([row.from, row.to, row.cc].join(', '))) {
@@ -139,16 +149,83 @@ export async function listContactEmails(userId: string, contactRow: ContactRow):
 		return [];
 	}
 
-	const allRows = await db
-		.select()
-		.from(email)
-		.where(inArray(email.accountId, accountIds))
-		.orderBy(asc(email.date));
+	/**
+	 * Step 1: walk the mail in small chunks with only the columns needed to match
+	 * addresses. Rows carry their full HTML, so `select *` over all of them held the
+	 * server for seconds and loaded gigabytes; each chunk is short and the loop yields.
+	 */
+	const matched: { id: string; date: Date | null }[] = [];
+	let afterId = '';
+	let finished = false;
+
+	while (!finished) {
+		const chunk = await db
+			.select({
+				id: email.id,
+				date: email.date,
+				from: email.from,
+				to: email.to,
+				cc: email.cc
+			})
+			.from(email)
+			.where(and(inArray(email.accountId, accountIds), gt(email.id, afterId)))
+			.orderBy(asc(email.id))
+			.limit(SCAN_CHUNK_SIZE);
+
+		for (const row of chunk) {
+			if (matchingContacts(row, [contactRow]).length > 0) {
+				matched.push({ id: row.id, date: row.date });
+			}
+		}
+
+		if (chunk.length < SCAN_CHUNK_SIZE) {
+			finished = true;
+		} else {
+			afterId = chunk[chunk.length - 1].id;
+			await yieldToEventLoop();
+		}
+	}
+
+	/** Oldest first; an email with no date sorts first, as it does in SQLite. */
+	matched.sort((a, b) => {
+		if (a.date === null && b.date === null) {
+			return 0;
+		}
+
+		if (a.date === null) {
+			return -1;
+		}
+
+		if (b.date === null) {
+			return 1;
+		}
+
+		return a.date.getTime() - b.date.getTime();
+	});
+
+	/** Step 2: the full rows, only for the emails that matched. */
+	const byId = new Map<string, EmailRow>();
+
+	for (let chunkStart = 0; chunkStart < matched.length; chunkStart += FULL_ROW_CHUNK_SIZE) {
+		const ids: string[] = [];
+
+		for (const item of matched.slice(chunkStart, chunkStart + FULL_ROW_CHUNK_SIZE)) {
+			ids.push(item.id);
+		}
+
+		for (const row of await db.select().from(email).where(inArray(email.id, ids))) {
+			byId.set(row.id, row);
+		}
+
+		await yieldToEventLoop();
+	}
 
 	const matches: EmailRow[] = [];
 
-	for (const row of allRows) {
-		if (matchingContacts(row, [contactRow]).length > 0) {
+	for (const item of matched) {
+		const row = byId.get(item.id);
+
+		if (row !== undefined) {
 			matches.push(row);
 		}
 	}

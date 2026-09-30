@@ -8,6 +8,8 @@ export type ThreadMessage = {
 	date: Date | null;
 	/** Plain-text body. Quotes are stripped by cutThread. */
 	text: string;
+	/** One line per attached file, e.g. "Agreement v1.pdf (document id: abc)". */
+	attachments?: string[];
 };
 
 export type ThreadCut = {
@@ -43,6 +45,7 @@ export function cutThread(
 
 	for (const message of messages) {
 		stripped.push({ ...message, text: stripQuotes(message.text) });
+		// ponytail: attachment lines are not counted in the token budget; they are a few words each.
 	}
 
 	let tokens = 0;
@@ -120,6 +123,10 @@ export function formatThread(messages: ThreadMessage[], newIds: string[]): strin
 
 		if (newIds.includes(message.id)) {
 			header = '[NEW MESSAGE]\n' + header;
+		}
+
+		if (message.attachments !== undefined && message.attachments.length > 0) {
+			header = header + '\nAttachments: ' + message.attachments.join('; ');
 		}
 
 		parts.push(header + '\n\n' + message.text);

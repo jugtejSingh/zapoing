@@ -127,6 +127,48 @@
       "when": 1790518174101,
       "tag": "0017_resource_content",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1790680325812,
+      "tag": "0018_email_list_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1790703182410,
+      "tag": "0019_draft_chat",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1790706777344,
+      "tag": "0020_file_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1790708143141,
+      "tag": "0021_drop_dead_draft_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1790708292834,
+      "tag": "0022_send_as_pdf",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1790781046682,
+      "tag": "0023_email_list_indexes",
+      "breakpoints": true
     }
   ]
 }

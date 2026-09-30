@@ -38,6 +38,17 @@ vi.mock('$lib/server/files/render/pdf', () => ({
 	}
 }));
 
+/** LibreOffice is covered by render.spec; here converting a Word file is a stub that can be told to fail. */
+const word = vi.hoisted(() => ({ converted: 0 }));
+
+vi.mock('$lib/server/files/render/docxToPdf', () => ({
+	docxToPdf: async () => {
+		word.converted = word.converted + 1;
+
+		return Buffer.from('%PDF-from-docx');
+	}
+}));
+
 /** Tests must never send real mail. */
 const smtp = vi.hoisted(() => ({
 	sent: [] as { raw: Buffer }[]
@@ -62,10 +73,12 @@ import { and, eq } from 'drizzle-orm';
 import ExcelJS from 'exceljs';
 import { simpleParser } from 'mailparser';
 import { db } from '$lib/server/db';
-import { document, documentVersion, draft, email, generatedFile } from '$lib/server/db/schema';
-import { getOwnedRunOutput, runsForEmails } from '$lib/server/ai/agentRun';
+import { agentRun, document, documentVersion, draft, email, generatedFile } from '$lib/server/db/schema';
+import { getOwnedRunOutput } from '$lib/server/ai/agentRun';
 import { addDocumentVersion, latestVersion } from '$lib/server/files/documents';
-import { listDraftFiles, removeGenerated } from '$lib/server/files/generated';
+import { listDraftFiles, removeErroredSince, removeGenerated } from '$lib/server/files/generated';
+import { ingestFile } from '$lib/server/fileIndex';
+import { readFileText } from '$lib/server/ai/graph/readFile';
 import { syncAccount } from '$lib/server/mailSync';
 import type { MailAccountCredentials } from '$lib/server/mailAccount';
 import {
@@ -84,6 +97,7 @@ import {
 	migrateTestDb,
 	resetTestDb
 } from '$lib/server/testing/testDb';
+import { fakePlannerReply, PLANNER_PREFIX } from '$lib/server/testing/fakePlanner';
 import { addTrackedPerson, findContactByEmail } from '$lib/server/trackedPerson';
 import { actions } from '../../../../routes/home/[id]/+page.server';
 import { outputFormat } from './document';
@@ -131,12 +145,16 @@ function attachedFileCount(request: ModelRequest): number {
 	return (content as unknown[]).length - 1;
 }
 
-function asksFor(documentId: string | null, change: string): string {
+function asksFor(
+	documentId: string | null,
+	change: string,
+	extra: Record<string, unknown> = {}
+): string {
 	return JSON.stringify({
 		reply_needed: true,
 		reason: 'asks for a change',
 		body: 'Updated file attached.',
-		documents: [{ document_id: documentId, change }]
+		documents: [{ document_id: documentId, change, ...extra }]
 	});
 }
 
@@ -229,6 +247,7 @@ beforeAll(() => {
 beforeEach(async () => {
 	delete (globalThis as { __zapoingJobWorker?: unknown }).__zapoingJobWorker;
 	pdf.fail = false;
+	word.converted = 0;
 	smtp.sent = [];
 	documentRequests = [];
 	uid = 0;
@@ -236,6 +255,10 @@ beforeEach(async () => {
 	vi.stubGlobal('fetch', fetchMock);
 	fetchMock.mockImplementation(async (_url: string, init: { body: string }) => {
 		const request = JSON.parse(init.body) as ModelRequest;
+
+		if (systemText(request).startsWith(PLANNER_PREFIX)) {
+			return okReply(fakePlannerReply(draftReply, request.messages));
+		}
 
 		if (systemText(request).startsWith('You write email replies')) {
 			return okReply(draftReply);
@@ -383,6 +406,248 @@ describe('generateDocument', () => {
 	});
 });
 
+describe('Word or PDF for the person who receives it', () => {
+	it('builds Word and sends it as a PDF converted at send time when the planner says pdf', async () => {
+		const emailId = await receive('Send me a contract');
+		draftReply = asksFor(null, 'A supply agreement', { deliver_as: 'pdf' });
+		documentReply = editedMarkdown('# Supply agreement\n\nTerm: 1 year.', true);
+
+		const written = await draftFor(emailId);
+		const files = await filesOf(written.id);
+
+		expect(files).toHaveLength(1);
+		expect(files[0]).toMatchObject({
+			filename: 'Supply agreement.docx',
+			format: 'docx',
+			sendAsPdf: true,
+			error: null
+		});
+		expect((await readFile(files[0].path ?? '')).subarray(0, 2).toString()).toBe('PK');
+		expect((await listDraftFiles(written.id))[0].sendAsPdf).toBe(true);
+		expect(word.converted).toBe(0);
+
+		expect(await sendDraft(emailId, written.id, 'Contract attached.')).toEqual({
+			message: 'Reply sent'
+		});
+
+		const sent = await simpleParser(smtp.sent[0].raw);
+		expect(sent.attachments).toHaveLength(1);
+		expect(sent.attachments[0].filename).toBe('Supply agreement.pdf');
+		expect(sent.attachments[0].contentType).toBe('application/pdf');
+		expect(sent.attachments[0].content.toString()).toBe('%PDF-from-docx');
+		expect(word.converted).toBe(1);
+	});
+
+	it('keeps a contract as Word when the planner says docx', async () => {
+		const documentId = await storedDocument('Contract.docx', DOCX_MIME, Buffer.from('PK fake docx'));
+		const emailId = await receive('Contract change');
+		draftReply = asksFor(documentId, 'Term to 2 years', { deliver_as: 'docx' });
+		documentReply = editedMarkdown('# Contract\n\nTerm: 2 years.', true);
+
+		const written = await draftFor(emailId);
+		const files = await filesOf(written.id);
+
+		expect(files[0]).toMatchObject({
+			filename: 'Contract v2.docx',
+			format: 'docx',
+			sendAsPdf: false,
+			error: null
+		});
+
+		await sendDraft(emailId, written.id, 'Updated contract attached.');
+
+		const sent = await simpleParser(smtp.sent[0].raw);
+		expect(sent.attachments[0].filename).toBe('Contract v2.docx');
+		expect(sent.attachments[0].content.subarray(0, 2).toString()).toBe('PK');
+		expect(word.converted).toBe(0);
+	});
+
+	it('turns a received PDF into Word that goes back out as a PDF', async () => {
+		const documentId = await storedDocument(
+			'Offer.pdf',
+			'application/pdf',
+			Buffer.from('%PDF-1.4 fake')
+		);
+		const emailId = await receive('Change the offer');
+		draftReply = asksFor(documentId, 'Price to 90', { deliver_as: 'pdf' });
+		documentReply = editedMarkdown('# Offer\n\nPrice: 90.');
+
+		const files = await filesOf((await draftFor(emailId)).id);
+
+		expect(files[0]).toMatchObject({
+			filename: 'Offer v2.docx',
+			format: 'docx',
+			sendAsPdf: true,
+			documentId
+		});
+	});
+
+	it('sends a received DOCX as a PDF when deliver_as is missing', async () => {
+		const documentId = await storedDocument('Notes.docx', DOCX_MIME, Buffer.from('PK fake docx'));
+		const emailId = await receive('Update the notes');
+		draftReply = asksFor(documentId, 'Payment to 45 days');
+		documentReply = editedMarkdown('# Notes\n\nPayment within 45 days.');
+
+		const written = await draftFor(emailId);
+		const files = await filesOf(written.id);
+
+		expect(files[0]).toMatchObject({ filename: 'Notes v2.docx', sendAsPdf: true });
+
+		await sendDraft(emailId, written.id, 'Attached.');
+
+		const sent = await simpleParser(smtp.sent[0].raw);
+		expect(sent.attachments[0].filename).toBe('Notes v2.pdf');
+		expect(word.converted).toBe(1);
+	});
+
+	it('does not turn a spreadsheet into Word, whatever deliver_as says', async () => {
+		const documentId = await storedDocument('Prices.xlsx', XLSX_MIME, Buffer.from('PK fake xlsx'));
+		const emailId = await receive('New price');
+		draftReply = asksFor(documentId, 'Widgets to 130', { deliver_as: 'pdf' });
+		documentReply = JSON.stringify({
+			contract: false,
+			name: 'Prices',
+			change_note: '- Widgets: 130',
+			sheets: [{ name: 'Prices', rows: [['Widgets', 130]] }]
+		});
+
+		const files = await filesOf((await draftFor(emailId)).id);
+
+		expect(files[0]).toMatchObject({ format: 'xlsx', sendAsPdf: false });
+	});
+
+	it('stores the Word file, not the PDF, as the version that was sent', async () => {
+		const emailId = await receive('Send me a contract');
+		draftReply = asksFor(null, 'A supply agreement', { deliver_as: 'pdf' });
+		documentReply = editedMarkdown('# Supply agreement\n\nTerm: 1 year.', true);
+		const written = await draftFor(emailId);
+		await sendDraft(emailId, written.id, 'Contract attached.');
+
+		const documents = await db.select().from(document).where(eq(document.contactId, contactId));
+		const stored = await latestVersion(documents[documents.length - 1].id);
+
+		expect(stored?.filename).toBe('Supply agreement.docx');
+	});
+});
+
+describe('the financial agent', () => {
+	function sheetReply(price: number): string {
+		return JSON.stringify({
+			contract: false,
+			name: 'Prices',
+			change_note: '- Widgets: 120 → ' + String(price),
+			sheets: [
+				{
+					name: 'Prices',
+					rows: [
+						['Item', 'Price'],
+						['Widgets', price]
+					]
+				}
+			]
+		});
+	}
+
+	it('makes a new spreadsheet', async () => {
+		const emailId = await receive('Send me the price list');
+		draftReply = asksFor(null, 'A price list with widgets at 130', { spreadsheet: true });
+		documentReply = sheetReply(130);
+
+		const files = await filesOf((await draftFor(emailId)).id);
+
+		expect(files).toHaveLength(1);
+		expect(files[0]).toMatchObject({
+			filename: 'Prices.xlsx',
+			format: 'xlsx',
+			sendAsPdf: false,
+			error: null
+		});
+
+		const workbook = new ExcelJS.Workbook();
+		await workbook.xlsx.load((await readFile(files[0].path ?? '')) as unknown as ArrayBuffer);
+		expect(workbook.worksheets[0].getCell('B2').value).toBe(130);
+	});
+
+	it('changes a received spreadsheet into the next version', async () => {
+		const documentId = await storedDocument('Prices.xlsx', XLSX_MIME, Buffer.from('PK fake xlsx'));
+		const emailId = await receive('New price');
+		draftReply = asksFor(documentId, 'Widgets to 130', { spreadsheet: true });
+		documentReply = sheetReply(130);
+
+		const files = await filesOf((await draftFor(emailId)).id);
+
+		expect(files[0]).toMatchObject({ filename: 'Prices v2.xlsx', format: 'xlsx', documentId });
+	});
+
+	it('removes its failed attempt and hands the same request to the document maker', async () => {
+		const emailId = await receive('Send me the price list');
+		draftReply = asksFor(null, 'A price list with widgets at 130', { spreadsheet: true });
+		documentReply = 'this is not the sheet json';
+
+		const files = await filesOf((await draftFor(emailId)).id);
+
+		/** The financial agent tried, then the document maker did, and only its failure is left to see. */
+		expect(documentRequests).toHaveLength(2);
+		expect(files).toHaveLength(1);
+		expect(files[0].error).not.toBeNull();
+	});
+});
+
+describe('removeErroredSince', () => {
+	it('keeps a good file', async () => {
+		const emailId = await receive('Send me a quote');
+		draftReply = asksFor(null, 'A quote for 100 widgets');
+		documentReply = editedMarkdown('# Quote\n\n100 widgets.');
+		const written = await draftFor(emailId);
+
+		await removeErroredSince(written.id, new Set());
+
+		expect(await filesOf(written.id)).toHaveLength(1);
+	});
+
+	it('removes a failed file made after the snapshot, and keeps one that was already there', async () => {
+		const emailId = await receive('Send me a quote');
+		draftReply = asksFor(null, 'A quote for 100 widgets');
+		documentReply = editedMarkdown('# Quote\n\n100 widgets.');
+		pdf.fail = true;
+		const written = await draftFor(emailId);
+		const failed = await filesOf(written.id);
+
+		expect(failed).toHaveLength(1);
+		expect(failed[0].error).not.toBeNull();
+
+		await removeErroredSince(written.id, new Set([failed[0].id]));
+		expect(await filesOf(written.id)).toHaveLength(1);
+
+		await removeErroredSince(written.id, new Set());
+		expect(await filesOf(written.id)).toHaveLength(0);
+	});
+});
+
+describe('read_file on a received document', () => {
+	it('gives the text once it is read, says so before, and refuses another contact', async () => {
+		const documentId = await storedDocument(
+			'Terms.txt',
+			'text/plain',
+			Buffer.from('Payment is due within thirty days.')
+		);
+		const latest = await latestVersion(documentId);
+
+		expect(await readFileText('u1', contactId, documentId)).toContain('has not been read yet');
+
+		expect(await ingestFile('attachment', latest?.id ?? '')).toBe(true);
+
+		const text = await readFileText('u1', contactId, documentId);
+		expect(text).toContain('Payment is due within thirty days.');
+		expect(text).toContain('Terms');
+
+		expect(await readFileText('u1', 'another-contact', documentId)).toContain(
+			'no file with that id'
+		);
+		expect(await readFileText('u1', contactId, 'nope')).toContain('no file with that id');
+	});
+});
+
 async function mergedDraft(emailId: string) {
 	const rows = await db
 		.select()
@@ -413,7 +678,6 @@ describe('merging drafts with documents', () => {
 		draftReply = JSON.stringify({
 			reply_needed: true,
 			reason: 'two changes to the notes',
-			intents: ['wants payment at 45 days', 'wants a delivery clause'],
 			body: 'Both changes are in the attached file.'
 		});
 		await mergeDrafts('u1', second);
@@ -430,7 +694,6 @@ describe('merging drafts with documents', () => {
 		expect(existsSync(path.dirname(older.path ?? ''))).toBe(false);
 
 		expect(merged.reason).toBe('two changes to the notes');
-		expect(merged.intents).toEqual(['wants payment at 45 days', 'wants a delivery clause']);
 	});
 
 	it('keeps two different new documents', async () => {
@@ -450,18 +713,17 @@ describe('merging drafts with documents', () => {
 		expect(await filesOf((await mergedDraft(second)).id)).toHaveLength(2);
 	});
 
-	it("lists the agent runs for the draft's emails, and only the owner can read their output", async () => {
+	it('only the owner can read a run\'s output', async () => {
 		const emailId = await receive('Send a quote');
 		draftReply = JSON.stringify({ reply_needed: true, reason: 'asks', body: 'Here it is.' });
 		await draftFor(emailId);
 
-		const runs = await runsForEmails([emailId]);
-		const drafting = runs.find((run) => run.agent === 'drafting');
+		const runs = await db.select().from(agentRun).where(eq(agentRun.emailId, emailId));
+		const drafting = runs.find((run) => run.agent === 'drafting.reply');
 
-		expect(drafting).toMatchObject({ ok: true, hasOutput: true });
+		expect(drafting).toMatchObject({ ok: true });
 		expect(await getOwnedRunOutput('u1', drafting?.id ?? '')).toContain('Here it is.');
 		expect(await getOwnedRunOutput('someone-else', drafting?.id ?? '')).toBeNull();
-		expect(await runsForEmails([])).toEqual([]);
 	});
 });
 
@@ -478,7 +740,7 @@ describe('sending a draft with a document', () => {
 
 		const sent = await simpleParser(smtp.sent[0].raw);
 		expect(sent.attachments).toHaveLength(1);
-		expect(sent.attachments[0].filename).toBe('Notes v2.docx');
+		expect(sent.attachments[0].filename).toBe('Notes v2.pdf');
 
 		const latest = await latestVersion(documentId);
 		expect(latest).toMatchObject({

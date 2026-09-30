@@ -1,6 +1,7 @@
 import { error, fail } from '@sveltejs/kit';
-import { runsForEmails } from '$lib/server/ai/agentRun';
 import { mergeDrafts, redraftEmail, senderContact } from '$lib/server/ai/agents/drafting';
+import { chatWithPlanner } from '$lib/server/ai/agents/planner';
+import { listDraftMessages } from '$lib/server/draftChat';
 import {
 	closeThreadDrafts,
 	getOwnedDraft,
@@ -73,20 +74,12 @@ async function loadThreadDrafts(
 				const files = await listDraftFiles(open.id);
 				console.log('[home/[id]] loadThreadDrafts: listDraftFiles took ' + (Date.now() - filesStart) + 'ms');
 
-				const runsStart = Date.now();
-				const runs = await runsForEmails(open.coversEmailIds);
-				console.log('[home/[id]] loadThreadDrafts: runsForEmails took ' + (Date.now() - runsStart) + 'ms');
-
 				result.active = {
 					id: open.id,
 					body: open.body ?? '',
+					messages: await listDraftMessages(open.id),
 					files,
-					resources: open.resources,
-					conflicts: open.conflicts,
-					reason: open.reason,
-					intents: open.intents,
-					threadCut: open.threadCut,
-					runs
+					conflicts: open.conflicts
 				};
 			}
 		} else if (open.emailId === latestId && result.skippedReason === null) {
@@ -215,8 +208,14 @@ export const actions: Actions = {
 				});
 			}
 
-			for (const attachment of await draftAttachments(sentDraft.id)) {
-				attachments.push(attachment);
+			try {
+				for (const attachment of await draftAttachments(sentDraft.id)) {
+					attachments.push(attachment);
+				}
+			} catch (caught) {
+				/** A failed PDF conversion must stop the send, not send the Word file instead. */
+				console.error('Preparing attachments failed:', caught);
+				return fail(500, { message: 'The attached files could not be prepared as PDF' });
 			}
 		}
 
@@ -278,34 +277,27 @@ export const actions: Actions = {
 		return { message: 'Reply sent' };
 	},
 
-	/** ponytail: model calls run inline in the request; move them to jobs if they get slow. */
-	regenerate: async ({ request, locals }) => {
+	/** ponytail: the planner loop runs inline in the request; move it to a job if turns get slow. */
+	chat: async ({ request, locals }) => {
 		if (!locals.user) {
 			error(401, 'Not signed in');
 		}
 
 		const formData = await request.formData();
 		const draftId = formData.get('draftId')?.toString() ?? '';
-		const instruction = formData.get('instruction')?.toString().trim() ?? '';
-		const found = await getOwnedDraft(locals.user.id, draftId);
+		const message = formData.get('message')?.toString().trim() ?? '';
 
-		if (found === null) {
-			return fail(404, { message: 'Draft not found' });
-		}
-
-		let instructionText: string | null = null;
-
-		if (instruction.length > 0) {
-			instructionText = instruction;
+		if (message.length === 0) {
+			return fail(400, { message: 'Write a message first' });
 		}
 
 		try {
-			await redraftEmail(locals.user.id, found.emailId, instructionText);
+			await chatWithPlanner(locals.user.id, draftId, message);
 		} catch (caught) {
-			return failMessage(caught, 'Could not regenerate the draft');
+			return failMessage(caught, 'The planner could not answer');
 		}
 
-		return { message: 'Draft regenerated' };
+		return { message: '' };
 	},
 
 	discard: async ({ request, locals }) => {
@@ -395,7 +387,7 @@ export const actions: Actions = {
 		const emailId = formData.get('emailId')?.toString() ?? '';
 
 		try {
-			await redraftEmail(locals.user.id, emailId, null);
+			await redraftEmail(locals.user.id, emailId);
 		} catch (caught) {
 			return failMessage(caught, 'Could not write a draft');
 		}

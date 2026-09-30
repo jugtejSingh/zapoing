@@ -4,7 +4,8 @@ import { registerDraftingAgent } from '$lib/server/ai/agents/drafting';
 import { registerMemoryAgent } from '$lib/server/ai/agents/memory';
 import { registerTemplateAgent } from '$lib/server/ai/agents/template';
 import { registerIngestion } from '$lib/server/files/ingest';
-import { indexPendingResources, registerResourceIndexing } from '$lib/server/resourceIndex';
+import { ingestMissingFiles, registerFileIngest } from '$lib/server/fileIndex';
+import { relocateAttachments } from '$lib/server/files/documents';
 import { auth } from '$lib/server/auth';
 import { startJobWorker } from '$lib/server/jobs/worker';
 import { startSyncWorker } from '$lib/server/syncWorker';
@@ -20,16 +21,19 @@ export const init: ServerInit = async () => {
 	registerDraftingAgent();
 	registerIngestion();
 	registerTemplateAgent();
-	registerResourceIndexing();
+	registerFileIngest();
 	startSyncWorker();
 	await startJobWorker();
-	indexPendingResources().catch((caught: unknown) => {
-		console.error('Indexing resources failed', caught);
-	});
+
+	relocateAttachments()
+		.then(() => ingestMissingFiles())
+		.catch((caught: unknown) => {
+			console.error('Indexing files failed', caught);
+		});
 };
 
 /** Routes reachable without a session. Everything else redirects to the login page. */
-const PUBLIC_PATHS = ['/'];
+const PUBLIC_PATHS = ['/', '/register'];
 
 function isPublic(pathname: string): boolean {
 	if (pathname.startsWith('/api/auth')) {

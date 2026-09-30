@@ -1,13 +1,16 @@
 import { createHash } from 'node:crypto';
-import { readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { copyFile, readFile, rm, rmdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { and, asc, desc, eq, inArray, max } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { contact, document, documentVersion, email } from '$lib/server/db/schema';
+import { queueIngest } from '$lib/server/fileIndex';
 import { isReadableByAI } from '$lib/server/files/allowlist';
 import {
+	attachmentFilePath,
+	dataDir,
 	documentDir,
 	documentMetaPath,
-	documentVersionPath,
 	documentWorkingInfoPath,
 	documentWorkingPath
 } from '$lib/server/storage/paths';
@@ -25,6 +28,32 @@ async function versionsOf(documentId: string): Promise<VersionRow[]> {
 
 export function sha256Of(content: Uint8Array): string {
 	return createHash('sha256').update(content).digest('hex');
+}
+
+/** "Contract.md.docx" → "Contract": every file-type ending is dropped, so the same file in another format has the same name. */
+export function nameWithoutExtensions(filename: string): string {
+	return filename.replace(/(\.(md|docx|pdf|xlsx))+$/i, '').trim();
+}
+
+/** The person's document with this name, ignoring file type and case; the pdf and the docx of one contract are one document. */
+export async function findContactDocumentByName(
+	contactId: string,
+	filename: string
+): Promise<string | null> {
+	const wanted = nameWithoutExtensions(filename).toLowerCase();
+	const rows = await db
+		.select({ id: document.id, name: document.name })
+		.from(document)
+		.where(eq(document.contactId, contactId))
+		.orderBy(asc(document.createdAt));
+
+	for (const row of rows) {
+		if (nameWithoutExtensions(row.name).toLowerCase() === wanted) {
+			return row.id;
+		}
+	}
+
+	return null;
 }
 
 /** True when this exact file is already one of the person's document versions. */
@@ -63,30 +92,57 @@ export type NewVersion = {
 	content: Buffer;
 };
 
-/** Writes the file as the next version of the document, records it and refreshes meta.json. */
+/** The person's primary address, the top folder of their received files. */
+async function personEmailOf(documentId: string): Promise<string> {
+	const rows = await db
+		.select({ emails: contact.emails })
+		.from(document)
+		.innerJoin(contact, eq(document.contactId, contact.id))
+		.where(eq(document.id, documentId))
+		.limit(1);
+
+	if (rows.length === 0 || rows[0].emails.length === 0) {
+		return 'unknown';
+	}
+
+	return rows[0].emails[0];
+}
+
+/**
+ * Writes the file as the next version of the document, under the person's email
+ * and the day it was received, records it, queues its ingestion and refreshes meta.json.
+ */
 export async function addDocumentVersion(documentId: string, file: NewVersion): Promise<number> {
 	const rows = await db
 		.select({ highest: max(documentVersion.version) })
 		.from(documentVersion)
 		.where(eq(documentVersion.documentId, documentId));
 	const version = (rows[0]?.highest ?? 0) + 1;
-	const target = await documentVersionPath(documentId, version, file.filename);
+	const target = await attachmentFilePath(
+		await personEmailOf(documentId),
+		file.receivedAt ?? new Date(),
+		file.filename
+	);
 
 	await writeFile(target, file.content);
-	await db.insert(documentVersion).values({
-		documentId,
-		version,
-		emailId: file.emailId,
-		sender: file.sender,
-		receivedAt: file.receivedAt,
-		sha256: sha256Of(file.content),
-		filename: file.filename,
-		contentType: file.contentType,
-		size: file.content.length,
-		path: target,
-		readable: isReadableByAI(file.filename, file.contentType)
-	});
+	const inserted = await db
+		.insert(documentVersion)
+		.values({
+			documentId,
+			version,
+			emailId: file.emailId,
+			sender: file.sender,
+			receivedAt: file.receivedAt,
+			sha256: sha256Of(file.content),
+			filename: file.filename,
+			contentType: file.contentType,
+			size: file.content.length,
+			path: target,
+			readable: isReadableByAI(file.filename, file.contentType)
+		})
+		.returning({ id: documentVersion.id });
 	await writeDocumentMeta(documentId);
+	await queueIngest('attachment', inserted[0].id);
 
 	return version;
 }
@@ -138,7 +194,7 @@ export async function writeDocumentMeta(documentId: string): Promise<void> {
 
 		entries.push({
 			version: version.version,
-			file: 'v' + String(version.version) + version.path.slice(version.path.lastIndexOf('.')),
+			file: path.relative(dataDir(), version.path),
 			filename: version.filename,
 			sender: version.sender,
 			messageId,
@@ -240,8 +296,7 @@ function compareReceived(a: VersionRow, b: VersionRow): number {
 
 /**
  * Moves every version of `mergeId` into `keepId`, renumbers all of them in
- * received order, moves the files into the kept document's folder and deletes
- * the emptied document. Both must be the same person's documents.
+ * received order and deletes the emptied document. Both must be the same person's documents.
  */
 export async function mergeDocuments(
 	userId: string,
@@ -275,28 +330,80 @@ export async function mergeDocuments(
 
 	all.sort(compareReceived);
 
-	/** Two steps, so renaming v2 to v3 never overwrites a v3 that has not moved yet. */
-	const staged: string[] = [];
-
-	for (const version of all) {
-		const temporary = version.path + '.merging';
-		await rename(version.path, temporary);
-		staged.push(temporary);
-	}
-
+	/** The files stay where they are; only the numbering and the owning document change. */
 	for (let index = 0; index < all.length; index++) {
-		const number = index + 1;
-		const target = await documentVersionPath(keepId, number, all[index].filename);
-		await rename(staged[index], target);
 		await db
 			.update(documentVersion)
-			.set({ documentId: keepId, version: number, path: target })
+			.set({ documentId: keepId, version: index + 1 })
 			.where(eq(documentVersion.id, all[index].id));
 	}
 
 	await db.delete(document).where(eq(document.id, mergeId));
-	await rm(documentDir(mergeId), { recursive: true, force: true });
+	await removeDocumentFolder(mergeId);
 	await writeDocumentMeta(keepId);
+}
+
+/** Removes the merged document's meta and working copy, and its folder once nothing else is in it. */
+async function removeDocumentFolder(documentId: string): Promise<void> {
+	await rm(await documentMetaPath(documentId), { force: true });
+	await rm(await documentWorkingInfoPath(documentId), { force: true });
+	await rm(await documentWorkingPath(documentId, 'markdown'), { force: true });
+	await rm(await documentWorkingPath(documentId, 'sheets'), { force: true });
+
+	try {
+		await rmdir(documentDir(documentId));
+	} catch {
+		/** Not empty: files from before the received-files layout still live here. */
+	}
+}
+
+/**
+ * Copies files stored in the old per-document folders into the person/date layout and
+ * repoints their rows. The originals are left in place. Safe to run again.
+ */
+export async function relocateAttachments(): Promise<number> {
+	const rows = await db
+		.select({ version: documentVersion, emails: contact.emails })
+		.from(documentVersion)
+		.innerJoin(document, eq(documentVersion.documentId, document.id))
+		.innerJoin(contact, eq(document.contactId, contact.id));
+	let moved = 0;
+
+	for (const row of rows) {
+		const version = row.version;
+
+		if (!version.path.startsWith(documentDir(version.documentId) + path.sep)) {
+			continue;
+		}
+
+		let personEmail = 'unknown';
+
+		if (row.emails.length > 0) {
+			personEmail = row.emails[0];
+		}
+
+		const target = await attachmentFilePath(
+			personEmail,
+			version.receivedAt ?? version.createdAt,
+			version.filename
+		);
+
+		try {
+			await copyFile(version.path, target);
+		} catch {
+			/** A file missing from disk stays as it is. */
+			continue;
+		}
+
+		await db
+			.update(documentVersion)
+			.set({ path: target })
+			.where(eq(documentVersion.id, version.id));
+		await writeDocumentMeta(version.documentId);
+		moved = moved + 1;
+	}
+
+	return moved;
 }
 
 export type WorkingKind = 'markdown' | 'sheets';

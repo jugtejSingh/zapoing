@@ -15,3 +15,5 @@ export * from './template.schema';
 export * from './generated.schema';
 
 export * from './resource.schema';
+
+export * from './fileIndex.schema';

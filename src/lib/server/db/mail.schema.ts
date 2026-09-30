@@ -1,7 +1,7 @@
 import { relations, sql } from 'drizzle-orm';
 import { index, integer, sqliteTable, text, unique } from 'drizzle-orm/sqlite-core';
 import { user } from './auth.schema';
-import type { EmailAttachment, EmailCategory, EmailDirection } from '$lib/types';
+import type { EmailAttachment, EmailDirection } from '$lib/types';
 
 /** One IMAP mailbox a user has connected. A user may have many. */
 export const mailAccount = sqliteTable(
@@ -74,7 +74,7 @@ export const email = sqliteTable(
 		/** Server thread id when the server has one, else derived from References. */
 		threadId: text('thread_id'),
 		/** Gmail's tab category (X-GM-LABELS). Null means the primary inbox. */
-		category: text('category').$type<EmailCategory>(),
+		category: text('category'),
 		/** 'in' for mail synced from INBOX, 'out' for mail synced from the Sent folder. */
 		direction: text('direction').$type<EmailDirection>().notNull().default('in'),
 		attachments: text('attachments', { mode: 'json' })
@@ -88,6 +88,20 @@ export const email = sqliteTable(
 	(table) => [
 		index('email_accountId_idx').on(table.accountId),
 		index('email_threadId_idx').on(table.accountId, table.mailbox, table.threadId),
+		/** getCachedThread filters on account + thread across mailboxes, so it can't use the one above. */
+		index('email_account_thread_idx').on(table.accountId, table.threadId),
+		/** Serves the inbox list: filter by direction/category, newest first, without touching the body blobs. */
+		index('email_list_idx').on(table.direction, table.category, table.date, table.uid),
+		/** Lets the inbox list read newest-first by date and uid, and stop after one page. */
+		index('email_dir_date_uid_idx').on(table.direction, table.date, table.uid),
+		/** Covers the "is there a newer message in this thread" check without reading the wide rows. */
+		index('email_thread_dir_date_uid_idx').on(
+			table.accountId,
+			table.threadId,
+			table.direction,
+			table.date,
+			table.uid
+		),
 		unique('email_unique').on(table.accountId, table.mailbox, table.uidValidity, table.uid)
 	]
 );

@@ -5,21 +5,22 @@ import { env } from '$env/dynamic/private';
 import { decryptSecret, encryptSecret } from '$lib/server/crypto';
 import { modelSettingsPath } from '$lib/server/storage/paths';
 
-/** Decision L: GLM 5.3 Flash by default. */
-export const DEFAULT_MODEL = 'glm-5.3-flash';
-export const DEFAULT_BASE_URL = 'https://api.z.ai/api/paas/v4';
+/** Every call goes through OpenRouter; GLM 5.3 Flash is the fallback for any agent with no model set. */
+export const DEFAULT_MODEL = 'z-ai/glm-5.3-flash';
+export const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 export const DEFAULT_THREAD_BUDGET_TOKENS = 8000;
 export const MIN_THREAD_BUDGET_TOKENS = 1000;
 export const MAX_THREAD_BUDGET_TOKENS = 200000;
 
+/** One model setting per agent. The settings page is built from this list. */
 export const AGENTS = [
-	'triage',
-	'context',
-	'drafting',
-	'memory',
-	'ingestion',
+	'planner',
+	'reply',
+	'template',
+	'financial',
 	'document',
-	'template'
+	'memory',
+	'ingestion'
 ] as const;
 
 export type Agent = (typeof AGENTS)[number];
@@ -27,7 +28,6 @@ export type Agent = (typeof AGENTS)[number];
 /** What is on disk. The API key is only ever stored encrypted. */
 type StoredSettings = {
 	apiKeyEncrypted: string | null;
-	baseUrl: string | null;
 	models: Partial<Record<Agent, string>>;
 	threadBudgetTokens: number | null;
 };
@@ -36,7 +36,7 @@ type StoredSettings = {
 export class ModelSettingsInputError extends Error {}
 
 function emptySettings(): StoredSettings {
-	return { apiKeyEncrypted: null, baseUrl: null, models: {}, threadBudgetTokens: null };
+	return { apiKeyEncrypted: null, models: {}, threadBudgetTokens: null };
 }
 
 /**
@@ -53,7 +53,10 @@ function readStored(): StoredSettings {
 	}
 
 	const settings = emptySettings();
-	Object.assign(settings, JSON.parse(text) as Partial<StoredSettings>);
+	const parsed = JSON.parse(text) as Partial<StoredSettings>;
+	settings.apiKeyEncrypted = parsed.apiKeyEncrypted ?? null;
+	settings.models = parsed.models ?? {};
+	settings.threadBudgetTokens = parsed.threadBudgetTokens ?? null;
 
 	return settings;
 }
@@ -85,11 +88,10 @@ export function modelConfig(agent: Agent): {
 		apiKey = env.MODEL_API_KEY;
 	}
 
+	// MODEL_BASE_URL is only a test and local-server escape hatch; there is no settings field for it.
 	let baseUrl = DEFAULT_BASE_URL;
 
-	if (settings.baseUrl !== null) {
-		baseUrl = settings.baseUrl;
-	} else if (env.MODEL_BASE_URL) {
+	if (env.MODEL_BASE_URL) {
 		baseUrl = env.MODEL_BASE_URL;
 	}
 
@@ -121,7 +123,6 @@ export type ModelSettingsView = {
 	keySource: 'settings' | 'env' | 'none';
 	/** The last 4 characters of a saved key, so the user can tell which one it is. */
 	keyEnding: string | null;
-	baseUrl: string;
 	models: Record<Agent, string>;
 	threadBudgetTokens: number | null;
 };
@@ -147,33 +148,9 @@ export function modelSettingsView(): ModelSettingsView {
 	return {
 		keySource,
 		keyEnding,
-		baseUrl: settings.baseUrl ?? '',
 		models,
 		threadBudgetTokens: settings.threadBudgetTokens
 	};
-}
-
-/** https only, so the key and the email content are never sent in the clear. Local servers may use http. */
-function checkBaseUrl(value: string): string {
-	let url: URL;
-
-	try {
-		url = new URL(value);
-	} catch {
-		throw new ModelSettingsInputError('The base URL is not a valid URL');
-	}
-
-	const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
-
-	if (url.protocol !== 'https:' && !(url.protocol === 'http:' && local)) {
-		throw new ModelSettingsInputError('The base URL must use https (http only for localhost)');
-	}
-
-	if (url.username !== '' || url.password !== '') {
-		throw new ModelSettingsInputError('Put the API key in its own field, not in the URL');
-	}
-
-	return url.toString().replace(/\/+$/, '');
 }
 
 function checkBudget(value: string): number | null {
@@ -205,7 +182,6 @@ function checkBudget(value: string): number | null {
  */
 export async function saveModelSettings(input: {
 	apiKey: string;
-	baseUrl: string;
 	models: Partial<Record<Agent, string>>;
 	threadBudgetTokens: string;
 }): Promise<void> {
@@ -214,12 +190,6 @@ export async function saveModelSettings(input: {
 
 	if (/\s/.test(apiKey)) {
 		throw new ModelSettingsInputError('The API key cannot contain spaces');
-	}
-
-	let baseUrl: string | null = null;
-
-	if (input.baseUrl.trim().length > 0) {
-		baseUrl = checkBaseUrl(input.baseUrl.trim());
 	}
 
 	const threadBudget = checkBudget(input.threadBudgetTokens);
@@ -237,7 +207,6 @@ export async function saveModelSettings(input: {
 		settings.apiKeyEncrypted = encryptSecret(apiKey);
 	}
 
-	settings.baseUrl = baseUrl;
 	settings.models = models;
 	settings.threadBudgetTokens = threadBudget;
 	await writeStored(settings);

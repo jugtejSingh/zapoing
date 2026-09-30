@@ -7,7 +7,7 @@
 	import { Label } from '$lib/components/ui/label';
 	import { RESOURCE_ACCEPT } from '$lib/components/resource/accept';
 
-	/** Name, keywords, tags and the file. */
+	/** Name and the file. */
 	let busy = $state(false);
 
 	function submitUpload() {
@@ -44,7 +44,7 @@
 	class="grid gap-3 rounded-lg border p-4"
 >
 	<h2 class="font-medium">Add a resource</h2>
-	<ResourceFields idPrefix="new" name="" keywords="" tags="" />
+	<ResourceFields idPrefix="new" name="" />
 	<div class="grid gap-1.5">
 		<Label for="resource-file">File</Label>
 		<input

@@ -26,13 +26,13 @@ describe('callModel', () => {
 	it('posts to the configured endpoint with the key and returns the reply text', async () => {
 		fetchMock.mockResolvedValue(okReply('hello'));
 
-		const reply = await callModel('drafting', [{ role: 'user', content: 'hi' }]);
+		const reply = await callModel('planner', [{ role: 'user', content: 'hi' }]);
 
 		expect(reply).toBe('hello');
 		expect(fetchMock.mock.calls[0][0]).toBe('https://model.test/v1/chat/completions');
 		const init = fetchMock.mock.calls[0][1] as RequestInit;
 		expect((init.headers as Record<string, string>).Authorization).toBe('Bearer test-key');
-		expect(sentBody().model).toBe('glm-5.3-flash');
+		expect(sentBody().model).toBe('z-ai/glm-5.3-flash');
 		expect(sentBody().messages).toEqual([{ role: 'user', content: 'hi' }]);
 	});
 
@@ -71,7 +71,7 @@ describe('callModel', () => {
 	it('throws with the status when the model call fails', async () => {
 		fetchMock.mockResolvedValue(new Response('rate limited', { status: 429 }));
 
-		await expect(callModel('triage', [{ role: 'user', content: 'hi' }])).rejects.toThrow(
+		await expect(callModel('memory', [{ role: 'user', content: 'hi' }])).rejects.toThrow(
 			'Model call failed (429): rate limited'
 		);
 	});

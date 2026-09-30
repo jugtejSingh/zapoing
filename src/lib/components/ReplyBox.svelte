@@ -116,7 +116,7 @@
 	action="?/reply"
 	enctype="multipart/form-data"
 	use:enhance={submitReply}
-	class="grid gap-2 border-t p-4"
+	class="grid gap-2 p-4"
 >
 	<input type="hidden" name="emailId" value={emailId} />
 	<input type="hidden" name="draftId" value={draftId()} />

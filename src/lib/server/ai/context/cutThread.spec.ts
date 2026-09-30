@@ -7,7 +7,18 @@ const dataDir = mkdtempSync(path.join(tmpdir(), 'zapoing-cut-'));
 
 vi.mock('$env/dynamic/private', () => ({ env: { DATA_DIR: dataDir } }));
 
-const { cutThread, logThreadCut } = await import('./cutThread');
+const { cutThread, formatThread, logThreadCut } = await import('./cutThread');
+
+describe('formatThread', () => {
+	it('lists a message\'s attachments under its header', () => {
+		const text = formatThread(
+			[{ id: 'a', from: 'me', date: null, text: 'Here it is', attachments: ['Agreement v1.pdf (document id: d1)'] }],
+			[]
+		);
+
+		expect(text).toContain('Attachments: Agreement v1.pdf (document id: d1)');
+	});
+});
 
 function message(id: string, chars: number) {
 	return { id, from: '', date: null, text: 'x'.repeat(chars) };

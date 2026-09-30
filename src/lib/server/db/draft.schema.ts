@@ -27,23 +27,11 @@ export const draft = sqliteTable(
 			.default('pending')
 			.notNull(),
 		body: text('body').notNull().default(''),
-		placeholders: text('placeholders', { mode: 'json' }).$type<string[]>().notNull().default([]),
 		/** The model's one-line reason: why a reply was or was not needed. */
 		reason: text('reason'),
-		/** What the email(s) asked for, one short line each, as the model read them. */
-		intents: text('intents', { mode: 'json' }).$type<string[]>().notNull().default([]),
 		/** Every email this draft answers: just emailId, or all the merged ones. */
 		coversEmailIds: text('covers_email_ids', { mode: 'json' })
 			.$type<string[]>()
-			.notNull()
-			.default([]),
-		/** Whether the thread was cut to fit the budget when this was written. */
-		threadCut: integer('thread_cut', { mode: 'boolean' }).notNull().default(false),
-		/** The user's regenerate instruction, e.g. "make it shorter". */
-		instruction: text('instruction'),
-		/** The resources sent with the draft, named as they were then so a later delete keeps the record. */
-		resources: text('resources', { mode: 'json' })
-			.$type<{ id: string; name: string }[]>()
 			.notNull()
 			.default([]),
 		/** Where the resources disagreed, as the model reported it. The newest one was used. */
@@ -60,6 +48,25 @@ export const draft = sqliteTable(
 		index('draft_emailId_idx').on(table.emailId),
 		index('draft_status_idx').on(table.status)
 	]
+);
+
+/** The chat between the user and the planner about one draft, oldest first. */
+export const draftMessage = sqliteTable(
+	'draft_message',
+	{
+		id: text('id')
+			.primaryKey()
+			.$defaultFn(() => crypto.randomUUID()),
+		draftId: text('draft_id')
+			.notNull()
+			.references(() => draft.id, { onDelete: 'cascade' }),
+		role: text('role', { enum: ['user', 'assistant'] }).notNull(),
+		content: text('content').notNull(),
+		createdAt: integer('created_at', { mode: 'timestamp_ms' })
+			.default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
+			.notNull()
+	},
+	(table) => [index('draft_message_draftId_idx').on(table.draftId)]
 );
 
 /** One row per model call an agent makes, so failures and slow calls are easy to find. */

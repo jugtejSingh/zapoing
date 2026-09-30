@@ -57,8 +57,8 @@
 	</div>
 
 	<p class="text-muted-foreground text-sm">
-		Where the AI calls go and which model each step uses. These apply to the whole app and override
-		.env. Blank fields use .env, then the defaults.
+		Which OpenRouter model each agent uses. These apply to the whole app and override .env. A blank
+		model uses the default.
 	</p>
 
 	<form
@@ -68,20 +68,6 @@
 		class="grid gap-4 rounded-lg border p-4"
 	>
 		<ApiKeyField keySource={data.settings.keySource} keyEnding={data.settings.keyEnding} />
-
-		<div class="grid gap-1.5">
-			<Label for="model-base-url">Base URL</Label>
-			<Input
-				id="model-base-url"
-				name="baseUrl"
-				type="url"
-				value={data.settings.baseUrl}
-				placeholder={data.defaultBaseUrl}
-			/>
-			<p class="text-muted-foreground text-xs">
-				Any OpenAI-compatible API. Must be https (http only for localhost).
-			</p>
-		</div>
 
 		<AgentModelFields
 			agents={data.agents}

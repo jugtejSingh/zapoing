@@ -85,6 +85,24 @@ export async function callModel(
 		throw new Error('No model API key: add one in Settings → Models or set MODEL_API_KEY');
 	}
 
+	const tag = '[AI:' + agent + ']';
+	const started = Date.now();
+
+	console.log('===== ' + tag + ' INPUT (model: ' + config.model + ') =====');
+
+	for (const message of messages) {
+		console.log('--- ' + message.role + ' ---');
+		console.log(message.content);
+	}
+
+	for (const file of files) {
+		console.log(
+			'--- file: ' + file.filename + ' (' + file.mime + ', ' + file.content.length + ' bytes) ---'
+		);
+	}
+
+	console.log('===== ' + tag + ' END INPUT =====');
+
 	const response = await fetch(config.baseUrl + '/chat/completions', {
 		method: 'POST',
 		headers: {
@@ -99,6 +117,8 @@ export async function callModel(
 
 	if (!response.ok) {
 		const detail = (await response.text()).slice(0, 500);
+		console.log('===== ' + tag + ' HTTP ERROR ' + response.status + ' =====');
+		console.log(detail);
 		throw new Error('Model call failed (' + response.status + '): ' + detail);
 	}
 
@@ -106,8 +126,15 @@ export async function callModel(
 	const content = data.choices?.[0]?.message?.content;
 
 	if (typeof content !== 'string') {
-		throw new Error('Model reply had no text');
+		const rawResponse = JSON.stringify(data);
+		console.log('===== ' + tag + ' NO TEXT IN REPLY (' + (Date.now() - started) + 'ms) =====');
+		console.log(rawResponse);
+		throw new Error('Model reply had no text. Raw response: ' + rawResponse.slice(0, 500));
 	}
+
+	console.log('===== ' + tag + ' OUTPUT (' + (Date.now() - started) + 'ms) =====');
+	console.log(content);
+	console.log('===== ' + tag + ' END OUTPUT =====');
 
 	return content;
 }

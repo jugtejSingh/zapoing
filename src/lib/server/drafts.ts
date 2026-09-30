@@ -1,5 +1,6 @@
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { db } from '$lib/server/db';
+import { forgetDraftState } from '$lib/server/ai/graph/checkpointer';
 import { draft, email, mailAccount } from '$lib/server/db/schema';
 import { threadEmails } from '$lib/server/threads';
 
@@ -81,14 +82,18 @@ export async function openDraftsFor(emailIds: string[]): Promise<DraftRow[]> {
 
 export async function setDraftStatus(draftId: string, status: DraftRow['status']): Promise<void> {
 	await db.update(draft).set({ status }).where(eq(draft.id, draftId));
+
+	/** Only pending and skipped drafts can still be talked about; the planner's memory goes with the rest. */
+	if (!OPEN_STATUSES.includes(status)) {
+		await forgetDraftState(draftId);
+	}
 }
 
 /** Retires the open drafts on one email, before a regenerate or "draft anyway" writes a new one. */
 export async function discardOpenDrafts(emailId: string): Promise<void> {
-	await db
-		.update(draft)
-		.set({ status: 'discarded' })
-		.where(and(eq(draft.emailId, emailId), inArray(draft.status, OPEN_STATUSES)));
+	for (const open of await openDraftsFor([emailId])) {
+		await setDraftStatus(open.id, 'discarded');
+	}
 }
 
 /**

@@ -1,9 +1,9 @@
 import { ImapFlow } from 'imapflow';
 import type { ParsedMail } from 'mailparser';
 import type { MailAccountCredentials } from '$lib/server/mailAccount';
-import type { Email, EmailAttachment, EmailCategory, ThreadSummary } from '$lib/types';
+import type { Email, EmailAttachment, ThreadSummary } from '$lib/types';
 
-export type { Email, EmailAttachment, EmailCategory, ThreadSummary };
+export type { Email, EmailAttachment, ThreadSummary };
 
 /**
  * ponytail: one connection per account per sync run, pool it if syncs get frequent.
@@ -127,30 +127,6 @@ function toAttachments(parsed: ParsedMail): EmailAttachment[] {
 	return attachments;
 }
 
-const GMAIL_CATEGORY_LABELS: Record<string, EmailCategory> = {
-	'\\CategoryPromotions': 'promotions',
-	'\\CategorySocial': 'social',
-	'\\CategoryUpdates': 'updates',
-	'\\CategoryForums': 'forums'
-};
-
-/** Gmail's tab category for a message, or null for the primary inbox. */
-export function categoryFromLabels(labels?: Set<string>): EmailCategory | null {
-	if (!labels) {
-		return null;
-	}
-
-	for (const label of labels) {
-		const category = GMAIL_CATEGORY_LABELS[label];
-
-		if (category) {
-			return category;
-		}
-	}
-
-	return null;
-}
-
 /**
  * Gmail and any OBJECTID server hand us a thread id. Everyone else gets one
  * derived from the reply chain: the root of References, then In-Reply-To, then
@@ -185,8 +161,7 @@ function deriveThreadId(uid: number, parsed: ParsedMail, serverThreadId?: string
 export function toEmail(
 	uid: number,
 	parsed: ParsedMail,
-	serverThreadId?: string,
-	category: EmailCategory | null = null
+	serverThreadId?: string
 ): Email {
 	let from = '';
 
@@ -227,8 +202,7 @@ export function toEmail(
 		date: parsed.date ?? null,
 		text: parsed.text ?? '',
 		html,
-		attachments: toAttachments(parsed),
-		category
+		attachments: toAttachments(parsed)
 	};
 }
 

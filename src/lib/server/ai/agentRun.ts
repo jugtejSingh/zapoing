@@ -1,7 +1,6 @@
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { agentRun, email, mailAccount } from '$lib/server/db/schema';
-import type { AgentRunSummary } from '$lib/types';
 
 const MAX_OUTPUT_CHARS = 20000;
 
@@ -44,38 +43,6 @@ export async function recordAgentRun<T>(
 			.values({ agent, emailId, ok: false, durationMs: Date.now() - started, error: message });
 		throw stepError;
 	}
-}
-
-/** ponytail: the newest 30 runs are plenty for one draft; page it if people need older ones. */
-const RUNS_SHOWN = 30;
-
-/** The runs for a draft's emails, newest first, without their output (fetched when opened). */
-export async function runsForEmails(emailIds: string[]): Promise<AgentRunSummary[]> {
-	if (emailIds.length === 0) {
-		return [];
-	}
-
-	const rows = await db
-		.select()
-		.from(agentRun)
-		.where(inArray(agentRun.emailId, emailIds))
-		.orderBy(desc(agentRun.createdAt))
-		.limit(RUNS_SHOWN);
-	const runs: AgentRunSummary[] = [];
-
-	for (const row of rows) {
-		runs.push({
-			id: row.id,
-			agent: row.agent,
-			ok: row.ok,
-			durationMs: row.durationMs,
-			error: row.error,
-			hasOutput: row.output !== null,
-			createdAt: row.createdAt
-		});
-	}
-
-	return runs;
 }
 
 /** A run's model output, only if its email belongs to one of the user's accounts. */

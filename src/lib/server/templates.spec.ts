@@ -29,6 +29,10 @@ vi.mock('$lib/server/files/render/pdf', () => ({
 	renderPdf: async (source: string) => Buffer.from('%PDF-stub\n' + source)
 }));
 
+vi.mock('$lib/server/files/render/docxToPdf', () => ({
+	docxToPdf: async () => Buffer.from('%PDF-from-docx')
+}));
+
 /** Tests must never send real mail. */
 const smtp = vi.hoisted(() => ({
 	sent: [] as { raw: Buffer }[]
@@ -54,6 +58,8 @@ import JSZip from 'jszip';
 import { db } from '$lib/server/db';
 import { draft, email, generatedFile, template } from '$lib/server/db/schema';
 import { prepareTemplate } from '$lib/server/ai/agents/template';
+import { parseTemplateAgentAction } from '$lib/server/ai/agents/templateAgent';
+import { ingestFile } from '$lib/server/fileIndex';
 import { createDraftForEmail } from '$lib/server/ai/agents/drafting';
 import { documentText, markFields } from '$lib/server/files/fill/officeXml';
 import { syncAccount } from '$lib/server/mailSync';
@@ -72,6 +78,7 @@ import {
 	migrateTestDb,
 	resetTestDb
 } from '$lib/server/testing/testDb';
+import { fakePlannerReply, PLANNER_PREFIX } from '$lib/server/testing/fakePlanner';
 import { addTrackedPerson, findContactByEmail } from '$lib/server/trackedPerson';
 import { actions } from '../../routes/home/[id]/+page.server';
 import { createTemplate, deleteTemplate, TemplateInputError } from './templates';
@@ -83,6 +90,10 @@ type ModelRequest = { messages: { role: string; content: unknown }[] };
 const fetchMock = vi.fn();
 let draftReply = '';
 let fillReply = '';
+/** What the template agent does: read the template before it fills, and how the file goes out. */
+let agentReadsFirst = false;
+let agentDeliverAs: 'docx' | 'pdf' | null = null;
+let agentRequests: ModelRequest[] = [];
 
 const PREPARE_REPLY = JSON.stringify({
 	fields: [
@@ -193,6 +204,9 @@ beforeAll(() => {
 beforeEach(async () => {
 	delete (globalThis as { __zapoingJobWorker?: unknown }).__zapoingJobWorker;
 	smtp.sent = [];
+	agentReadsFirst = false;
+	agentDeliverAs = null;
+	agentRequests = [];
 	fetchMock.mockReset();
 	vi.stubGlobal('fetch', fetchMock);
 	fetchMock.mockImplementation(async (_url: string, init: { body: string }) => {
@@ -203,8 +217,66 @@ beforeEach(async () => {
 			return okReply(PREPARE_REPLY);
 		}
 
+		if (system.startsWith('You are the template agent')) {
+			agentRequests.push(request);
+
+			let asked: RegExpExecArray | null = null;
+			const pattern = /Use template (\S+?): ([^"\\]*)/g;
+			const everything = JSON.stringify(request.messages);
+			let found = pattern.exec(everything);
+
+			/** The newest ask wins: the agent's history carries the earlier ones. */
+			while (found !== null) {
+				asked = found;
+				found = pattern.exec(everything);
+			}
+
+			if (asked === null || asked[1] === 'none') {
+				return okReply(JSON.stringify({ action: 'none', reason: 'no NDA template' }));
+			}
+
+			let spoken = 0;
+
+			for (const message of request.messages) {
+				if (message.role === 'assistant') {
+					spoken = spoken + 1;
+				}
+			}
+
+			if (agentReadsFirst && spoken === 0) {
+				return okReply(JSON.stringify({ action: 'read', template_id: asked[1] }));
+			}
+
+			const fill: Record<string, unknown> = {
+				action: 'fill',
+				template_id: asked[1],
+				change: asked[2]
+			};
+
+			if (agentDeliverAs !== null) {
+				fill.deliver_as = agentDeliverAs;
+			}
+
+			return okReply(JSON.stringify(fill));
+		}
+
 		if (system.startsWith('You fill templates')) {
 			return okReply(fillReply);
+		}
+
+		if (system.startsWith('You edit documents')) {
+			return okReply(
+				JSON.stringify({
+					contract: true,
+					name: 'NDA',
+					change_note: '- Written from scratch',
+					markdown: '# NDA\n\nBetween us and [[counterparty-name]].'
+				})
+			);
+		}
+
+		if (system.startsWith(PLANNER_PREFIX)) {
+			return okReply(fakePlannerReply(draftReply, request.messages));
 		}
 
 		if (system.startsWith('You write email replies')) {
@@ -323,7 +395,13 @@ describe('templates', () => {
 			.where(eq(generatedFile.draftId, drafts[0].id));
 
 		expect(files).toHaveLength(1);
-		expect(files[0]).toMatchObject({ templateId, format: 'docx', error: null, sourcePath: null });
+		expect(files[0]).toMatchObject({
+			templateId,
+			format: 'docx',
+			error: null,
+			sourcePath: null,
+			sendAsPdf: true
+		});
 		expect(files[0].filename).toMatch(/^Mutual NDA.*\.docx$/);
 		expect(files[0].placeholders).toEqual(['effective-date']);
 
@@ -353,9 +431,11 @@ describe('templates', () => {
 		await actions.reply(actionEvent(emailId, 'reply', sendForm(emailId, drafts[0].id)));
 
 		expect(smtp.sent).toHaveLength(1);
+		expect(smtp.sent[0].raw.toString()).toContain('.pdf');
+		expect(smtp.sent[0].raw.toString()).not.toContain('.docx');
 	});
 
-	it('makes nothing when no template fits, and says so on the draft', async () => {
+	it('writes the document from scratch when no template fits, and flags it', async () => {
 		const emailId = await receive('Can you send your NDA?');
 		draftReply = JSON.stringify({
 			reply_needed: true,
@@ -372,7 +452,181 @@ describe('templates', () => {
 			.where(eq(generatedFile.draftId, drafts[0].id));
 
 		expect(files).toHaveLength(1);
-		expect(files[0].path).toBeNull();
-		expect(files[0].error).toContain('No template fits "NDA"');
+		expect(files[0].error).toBeNull();
+		expect(files[0].templateId).toBeNull();
+		expect(files[0].path).not.toBeNull();
+		expect(files[0].changeNote).toContain('No template fits this document');
+	});
+});
+
+const FULL_VALUES = JSON.stringify({
+	values: {
+		'counterparty-name': 'Acme Ltd',
+		'effective-date': '1 March 2026',
+		'governing-law': 'England & Wales',
+		'notice-period': 'sixty days'
+	},
+	change_note: '- Everything filled in'
+});
+
+async function draftForNda(templateId: string): Promise<{ emailId: string; draftId: string }> {
+	const emailId = await receive('Can you send your NDA?');
+	draftReply = JSON.stringify({
+		reply_needed: true,
+		reason: 'asks for the NDA',
+		body: 'NDA attached.',
+		documents: [{ template_id: templateId, change: 'NDA for Acme' }]
+	});
+
+	await createDraftForEmail({ contactId, emailId });
+	const drafts = await db.select().from(draft).where(eq(draft.emailId, emailId));
+
+	return { emailId, draftId: drafts[0].id };
+}
+
+async function filesOnDraft(draftId: string) {
+	return db.select().from(generatedFile).where(eq(generatedFile.draftId, draftId));
+}
+
+describe('parseTemplateAgentAction', () => {
+	it('reads read, fill and none, with fill going out as a PDF unless Word is asked for', () => {
+		expect(parseTemplateAgentAction('{"action":"read","template_id":"t1"}')).toEqual({
+			action: 'read',
+			templateId: 't1'
+		});
+		expect(
+			parseTemplateAgentAction('{"action":"fill","template_id":"t1","change":"for Acme"}')
+		).toEqual({ action: 'fill', templateId: 't1', change: 'for Acme', deliverAs: 'pdf' });
+		expect(
+			parseTemplateAgentAction(
+				'{"action":"fill","template_id":"t1","change":"for Acme","deliver_as":"docx"}'
+			)
+		).toEqual({ action: 'fill', templateId: 't1', change: 'for Acme', deliverAs: 'docx' });
+		expect(
+			parseTemplateAgentAction(
+				'{"action":"fill","template_id":"t1","change":"for Acme","deliver_as":"rtf"}'
+			)
+		).toMatchObject({ deliverAs: 'pdf' });
+		expect(parseTemplateAgentAction('{"action":"none","reason":"no NDA"}')).toEqual({
+			action: 'none',
+			reason: 'no NDA'
+		});
+	});
+
+	it('strips a code fence, and takes anything unusable as none so the document maker takes over', () => {
+		const fence = '```';
+
+		expect(
+			parseTemplateAgentAction(fence + 'json\n{"action":"read","template_id":"t1"}\n' + fence)
+		).toEqual({ action: 'read', templateId: 't1' });
+		expect(parseTemplateAgentAction('I think the NDA fits')).toMatchObject({ action: 'none' });
+		expect(parseTemplateAgentAction('{"action":"fill","template_id":"t1"}')).toMatchObject({
+			action: 'none'
+		});
+		expect(parseTemplateAgentAction('{"action":"read"}')).toMatchObject({ action: 'none' });
+		expect(parseTemplateAgentAction('{"action":"launch"}')).toEqual({
+			action: 'none',
+			reason: 'No template fits'
+		});
+	});
+});
+
+describe('the template agent', () => {
+	it('sends a filled Word template as a PDF by default, converted at send time', async () => {
+		const templateId = await readyNda();
+		fillReply = FULL_VALUES;
+		const { emailId, draftId } = await draftForNda(templateId);
+
+		const files = await filesOnDraft(draftId);
+		expect(files[0]).toMatchObject({ format: 'docx', sendAsPdf: true, error: null });
+		expect(files[0].placeholders).toEqual([]);
+
+		await actions.reply(actionEvent(emailId, 'reply', sendForm(emailId, draftId)));
+
+		expect(smtp.sent).toHaveLength(1);
+		expect(smtp.sent[0].raw.toString()).toContain('.pdf');
+		expect(smtp.sent[0].raw.toString()).not.toContain('.docx');
+	});
+
+	it('sends it as Word when the agent says docx, and never converts', async () => {
+		const templateId = await readyNda();
+		fillReply = FULL_VALUES;
+		agentDeliverAs = 'docx';
+		const { emailId, draftId } = await draftForNda(templateId);
+
+		const files = await filesOnDraft(draftId);
+		expect(files[0]).toMatchObject({ format: 'docx', sendAsPdf: false, error: null });
+
+		await actions.reply(actionEvent(emailId, 'reply', sendForm(emailId, draftId)));
+
+		expect(smtp.sent).toHaveLength(1);
+		expect(smtp.sent[0].raw.toString()).toContain('.docx');
+		expect(smtp.sent[0].raw.toString()).not.toContain('.pdf');
+	});
+
+	it('reads the template before it fills it, and only then makes the file', async () => {
+		const templateId = await readyNda();
+		expect(await ingestFile('template', templateId)).toBe(true);
+		fillReply = FULL_VALUES;
+		agentReadsFirst = true;
+		const { draftId } = await draftForNda(templateId);
+
+		expect(agentRequests).toHaveLength(2);
+
+		const second = JSON.stringify(agentRequests[1].messages);
+		expect(second).toContain('Mutual Non-Disclosure Agreement');
+		expect(second).toContain('counterparty-name');
+
+		const files = await filesOnDraft(draftId);
+		expect(files).toHaveLength(1);
+		expect(files[0]).toMatchObject({ templateId, error: null });
+	});
+
+	it('is told there is no such template when it reads an id that does not exist', async () => {
+		fillReply = FULL_VALUES;
+		agentReadsFirst = true;
+		const emailId = await receive('Can you send your NDA?');
+		draftReply = JSON.stringify({
+			reply_needed: true,
+			reason: 'asks for the NDA',
+			body: 'NDA attached.',
+			documents: [{ template_id: 'not-a-template', change: 'NDA for Acme' }]
+		});
+
+		await createDraftForEmail({ contactId, emailId });
+
+		expect(JSON.stringify(agentRequests[1].messages)).toContain(
+			'there is no template with that id'
+		);
+	});
+
+	it('removes a failed fill from the draft and has the document maker write it instead', async () => {
+		const templateId = await readyNda();
+		fillReply = 'this is not json';
+		const { draftId } = await draftForNda(templateId);
+
+		const files = await filesOnDraft(draftId);
+
+		expect(files).toHaveLength(1);
+		expect(files[0].error).toBeNull();
+		expect(files[0].templateId).toBeNull();
+		expect(files[0].changeNote).toContain('No template fits this document');
+	});
+
+	it('does not fill a template that belongs to someone else', async () => {
+		await createTestUser('u2');
+		const other = await createTemplate('u2', {
+			name: 'Their NDA',
+			description: 'Not yours',
+			file: docxFile(await sampleNda())
+		});
+		await prepareTemplate({ templateId: other.id });
+		fillReply = FULL_VALUES;
+		const { draftId } = await draftForNda(other.id);
+
+		const files = await filesOnDraft(draftId);
+
+		expect(files).toHaveLength(1);
+		expect(files[0].templateId).toBeNull();
 	});
 });

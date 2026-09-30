@@ -24,6 +24,19 @@
 			await update({ reset: false });
 		};
 	}
+
+	/** The logo forms are separate from the profile form, so saving one never touches the other. */
+	function submitLogo() {
+		return async ({ result, update }: { result: { type: string; data?: { message?: string } }; update: () => Promise<void> }) => {
+			if (result.type === 'failure') {
+				toast.error(result.data?.message ?? 'Could not save the logo');
+				return;
+			}
+
+			toast.success('Logo updated');
+			await update();
+		};
+	}
 </script>
 
 <svelte:head>
@@ -74,6 +87,15 @@
 			multiline
 		/>
 
+		<h2 class="pt-2 text-base font-semibold">Documents</h2>
+		<p class="text-muted-foreground -mt-2 text-xs">
+			Applied to the documents the AI writes. Leave a field empty to leave it out.
+		</p>
+		<FormField name="font" label="Font" value={data.profile.branding.font} hint="e.g. Calibri. It must be installed on this computer" />
+		<FormField name="primaryColor" label="Colour" value={data.profile.branding.primaryColor} hint="Hex, e.g. #1a4d8f. Used for headings" />
+		<FormField name="headerText" label="Header" value={data.profile.branding.headerText} hint="Next to the logo, at the top of every page" />
+		<FormField name="footerText" label="Footer" value={data.profile.branding.footerText} hint="At the bottom of every page" />
+
 		<Button type="submit" disabled={saving} class="justify-self-start">
 			{#if saving}
 				Saving…
@@ -82,4 +104,24 @@
 			{/if}
 		</Button>
 	</form>
+
+	<div class="grid gap-2">
+		<h2 class="text-sm font-medium">Logo</h2>
+		<form
+			method="post"
+			action="?/logo"
+			enctype="multipart/form-data"
+			use:enhance={submitLogo}
+			class="flex items-center gap-2"
+		>
+			<input type="file" name="logo" accept="image/png,image/jpeg" class="text-xs" />
+			<Button type="submit" size="sm" variant="secondary">Upload</Button>
+		</form>
+		{#if data.hasLogo}
+			<form method="post" action="?/removeLogo" use:enhance={submitLogo} class="flex items-center gap-2">
+				<span class="text-muted-foreground text-xs">A logo is set.</span>
+				<Button type="submit" size="sm" variant="ghost">Remove</Button>
+			</form>
+		{/if}
+	</div>
 </main>

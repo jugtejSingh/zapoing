@@ -5,8 +5,6 @@ export type EmailAttachment = {
 };
 
 /** Gmail's tab categories. Null means the primary inbox. */
-export type EmailCategory = 'promotions' | 'social' | 'updates' | 'forums';
-
 /** 'in' came from INBOX, 'out' from the Sent folder. */
 export type EmailDirection = 'in' | 'out';
 
@@ -24,7 +22,6 @@ export type ThreadSummary = {
 	snippet: string;
 	attachmentCount: number;
 	messageCount: number;
-	category: EmailCategory | null;
 	/** Pending drafts on the thread's unanswered emails. */
 	draftCount: number;
 };
@@ -50,7 +47,6 @@ export type Email = {
 	text: string;
 	html: string | null;
 	attachments: EmailAttachment[];
-	category: EmailCategory | null;
 };
 
 /** An `Email` as read back from the cache, which also has a stable row id. */
@@ -99,6 +95,15 @@ export type DraftFile = {
 	isNewDocument: boolean;
 	/** [[fields]] still in the file; the reply cannot be sent until they are filled. */
 	placeholders: string[];
+	/** A Word file that goes out converted to PDF. */
+	sendAsPdf: boolean;
+};
+
+/** One message in the chat between the user and the planner. */
+export type DraftChatMessage = {
+	id: string;
+	role: 'user' | 'assistant';
+	content: string;
 };
 
 /** The drafts waiting on a thread's unanswered emails, for the thread page. */
@@ -107,16 +112,10 @@ export type ThreadDrafts = {
 	active: {
 		id: string;
 		body: string;
+		messages: DraftChatMessage[];
 		files: DraftFile[];
-		/** The resources sent with the draft, by the name they had then. */
-		resources: { id: string; name: string }[];
-		/** Where those resources disagreed; the newest was used. */
+		/** Where the resources disagreed; the newest was used. */
 		conflicts: string[];
-		/** For the "why" panel. */
-		reason: string | null;
-		intents: string[];
-		threadCut: boolean;
-		runs: AgentRunSummary[];
 	} | null;
 	/** Why the latest email was skipped, when nothing is pending. */
 	skippedReason: string | null;
@@ -127,26 +126,15 @@ export type ThreadDrafts = {
 	canDraft: boolean;
 };
 
-/** One agent step in the log viewer. The model's output is fetched when the row is opened. */
-export type AgentRunSummary = {
-	id: string;
-	agent: string;
-	ok: boolean;
-	durationMs: number;
-	error: string | null;
-	hasOutput: boolean;
-	createdAt: Date;
-};
-
 /** A reference file on the resources page. */
 export type ResourceSummary = {
 	id: string;
 	name: string;
-	keywords: string;
-	tags: string[];
 	filename: string;
 	updatedAt: Date;
-	/** Whether the file's contents are searchable yet. */
+	/** What the AI wrote about the file once it read it. */
+	description: string;
+	/** Whether the AI has read the file yet. */
 	indexStatus: 'pending' | 'ready' | 'failed';
 	indexError: string | null;
 };

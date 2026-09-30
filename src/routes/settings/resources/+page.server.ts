@@ -7,6 +7,7 @@ import {
 	ResourceInputError,
 	updateResource
 } from '$lib/server/resources';
+import { indexRows } from '$lib/server/fileIndex';
 import type { ResourceSummary } from '$lib/types';
 import type { Actions, PageServerLoad } from './$types';
 
@@ -47,16 +48,35 @@ export const load: PageServerLoad = async (event) => {
 
 	const resources: ResourceSummary[] = [];
 
-	for (const row of await listResources(event.locals.user.id)) {
+	const rows = await listResources(event.locals.user.id);
+	const ids: string[] = [];
+
+	for (const row of rows) {
+		ids.push(row.id);
+	}
+
+	const index = await indexRows('resource', ids);
+
+	for (const row of rows) {
+		let description = '';
+		let indexStatus: ResourceSummary['indexStatus'] = 'pending';
+		let indexError: string | null = null;
+		const indexed = index.get(row.id);
+
+		if (indexed !== undefined) {
+			description = indexed.description;
+			indexStatus = indexed.status;
+			indexError = indexed.error;
+		}
+
 		resources.push({
 			id: row.id,
 			name: row.name,
-			keywords: row.keywords,
-			tags: row.tags,
 			filename: row.filename,
 			updatedAt: row.updatedAt,
-			indexStatus: row.indexStatus,
-			indexError: row.indexError
+			description,
+			indexStatus,
+			indexError
 		});
 	}
 
@@ -79,8 +99,6 @@ export const actions: Actions = {
 		try {
 			await createResource(locals.user.id, {
 				name: field(formData, 'name'),
-				keywords: field(formData, 'keywords'),
-				tags: field(formData, 'tags'),
 				file
 			});
 		} catch (caught) {
@@ -99,9 +117,7 @@ export const actions: Actions = {
 
 		try {
 			const updated = await updateResource(locals.user.id, field(formData, 'resourceId'), {
-				name: field(formData, 'name'),
-				keywords: field(formData, 'keywords'),
-				tags: field(formData, 'tags')
+				name: field(formData, 'name')
 			});
 
 			if (!updated) {

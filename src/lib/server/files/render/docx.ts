@@ -1,6 +1,12 @@
 import {
+	AlignmentType,
 	Document,
+	Footer,
+	Header,
 	HeadingLevel,
+	ImageRun,
+	type IPropertiesOptions,
+	type ISectionOptions,
 	Packer,
 	Paragraph,
 	Table,
@@ -10,6 +16,7 @@ import {
 	WidthType
 } from 'docx';
 import { Lexer, type Token, type Tokens } from 'marked';
+import { hasFooter, hasHeader, type Branding } from '$lib/server/branding';
 
 type RunStyle = {
 	bold: boolean;
@@ -195,11 +202,89 @@ function blocks(tokens: Token[]): (Paragraph | Table)[] {
 	return children;
 }
 
-/** Markdown → DOCX. Covers headings, paragraphs, lists, tables and bold/italic, nothing more. */
-export async function renderDocx(source: string): Promise<Buffer> {
-	const document = new Document({
-		sections: [{ children: blocks(new Lexer({ gfm: true }).lex(source)) }]
+const LOGO_HEIGHT_PX = 40;
+
+function headerParagraph(branding: Branding): Paragraph {
+	const children: (ImageRun | TextRun)[] = [];
+
+	if (branding.logo !== null) {
+		const ratio = branding.logo.width / branding.logo.height;
+
+		children.push(
+			new ImageRun({
+				type: branding.logo.type,
+				data: branding.logo.data,
+				transformation: { width: Math.round(LOGO_HEIGHT_PX * ratio), height: LOGO_HEIGHT_PX }
+			})
+		);
+	}
+
+	if (branding.headerText.length > 0) {
+		if (branding.logo !== null) {
+			children.push(new TextRun({ text: '   ' }));
+		}
+
+		children.push(new TextRun({ text: branding.headerText }));
+	}
+
+	return new Paragraph({ children });
+}
+
+function footerParagraph(branding: Branding): Paragraph {
+	return new Paragraph({
+		alignment: AlignmentType.CENTER,
+		children: [new TextRun({ text: branding.footerText, size: 18 })]
 	});
+}
+
+/** The user's font and heading colour as document defaults. Empty settings leave Word's defaults. */
+function brandingStyles(branding: Branding): IPropertiesOptions['styles'] {
+	let defaults: NonNullable<IPropertiesOptions['styles']>['default'] = {};
+
+	if (branding.font.length > 0) {
+		defaults = { ...defaults, document: { run: { font: branding.font } } };
+	}
+
+	if (branding.primaryColor.length > 0) {
+		const run = { color: branding.primaryColor.slice(1) };
+		defaults = {
+			...defaults,
+			heading1: { run },
+			heading2: { run },
+			heading3: { run },
+			heading4: { run },
+			heading5: { run },
+			heading6: { run }
+		};
+	}
+
+	return { default: defaults };
+}
+
+/**
+ * Markdown → DOCX. Covers headings, paragraphs, lists, tables and bold/italic, nothing more.
+ * With branding: the user's font and colour, the logo and header text on top of each page,
+ * the footer text at the bottom.
+ */
+export async function renderDocx(source: string, branding: Branding | null = null): Promise<Buffer> {
+	const children = blocks(new Lexer({ gfm: true }).lex(source));
+	let styles: IPropertiesOptions['styles'] = undefined;
+	let headers: ISectionOptions['headers'] = undefined;
+	let footers: ISectionOptions['footers'] = undefined;
+
+	if (branding !== null) {
+		styles = brandingStyles(branding);
+
+		if (hasHeader(branding)) {
+			headers = { default: new Header({ children: [headerParagraph(branding)] }) };
+		}
+
+		if (hasFooter(branding)) {
+			footers = { default: new Footer({ children: [footerParagraph(branding)] }) };
+		}
+	}
+
+	const document = new Document({ styles, sections: [{ headers, footers, children }] });
 
 	return Packer.toBuffer(document);
 }

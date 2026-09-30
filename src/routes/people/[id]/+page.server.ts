@@ -6,7 +6,7 @@ import { listContactEmailsPage } from '$lib/server/threads';
 import { getContact, setTracked } from '$lib/server/trackedPerson';
 import type { Actions, PageServerLoad } from './$types';
 
-export const PERSON_EMAILS_PAGE_SIZE = 20;
+const PERSON_EMAILS_PAGE_SIZE = 20;
 
 export const load: PageServerLoad = async ({ params, locals }) => {
 	if (!locals.user) {

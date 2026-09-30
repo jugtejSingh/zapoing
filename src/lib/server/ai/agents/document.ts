@@ -4,8 +4,16 @@ import { db } from '$lib/server/db';
 import { document, draft, email, generatedFile } from '$lib/server/db/schema';
 import { recordAgentRun } from '$lib/server/ai/agentRun';
 import { callModel, type ModelFile } from '$lib/server/ai/model';
-import { latestVersion, readWorkingCopy, type WorkingKind } from '$lib/server/files/documents';
+import { indexedText, indexRows } from '$lib/server/fileIndex';
+import { getOwnedResource } from '$lib/server/resources';
+import {
+	latestVersion,
+	nameWithoutExtensions,
+	readWorkingCopy,
+	type WorkingKind
+} from '$lib/server/files/documents';
 import { renderDocx } from '$lib/server/files/render/docx';
+import { readBranding } from '$lib/server/branding';
 import { renderPdf } from '$lib/server/files/render/pdf';
 import { renderXlsx, type Sheet, type SheetCell } from '$lib/server/files/render/xlsx';
 import { generatedFilePath } from '$lib/server/storage/paths';
@@ -18,13 +26,22 @@ type Format = 'pdf' | 'docx' | 'xlsx';
 
 /**
  * What the drafting model asked for: a change to a stored document, a new one
- * when documentId is null, a filled template, or (missingTemplate) a standard
- * document no template fits.
+ * when documentId is null, a filled template, or (missingTemplate) a new
+ * document standing in for a standard one no template fits.
  */
 export type DocumentRequest = {
 	documentId: string | null;
+	/** A resource to make a changed copy of; the original is never touched. */
+	sourceResourceId: string | null;
 	templateId: string | null;
 	missingTemplate: string | null;
+	/** A new or changed spreadsheet: the financial agent's work. */
+	spreadsheet: boolean;
+	/**
+	 * What the user receives: a Word file, or a PDF made from the Word file with LibreOffice.
+	 * null keeps the old rule: Word stays Word, everything else is a PDF.
+	 */
+	deliverAs: 'docx' | 'pdf' | null;
 	change: string;
 };
 
@@ -39,6 +56,9 @@ const SHEET_EXTENSIONS = ['xlsx', 'xls', 'csv'];
 
 const REBUILD_NOTE =
 	'Rebuilt from the text of the previous version: its exact layout, fonts, images and formulas are not kept.';
+
+const NO_TEMPLATE_NOTE =
+	'No template fits this document, so it was written from scratch. Check it before sending.';
 
 function systemPrompt(kind: WorkingKind): string {
 	let output = '"markdown": "the full document in GitHub Markdown"';
@@ -146,17 +166,23 @@ export async function describeDocuments(contactId: string): Promise<string> {
 			continue;
 		}
 
-		lines.push(
+		let line =
 			'- id: ' +
-				row.id +
-				' | ' +
-				row.name +
-				' | latest: v' +
-				String(latest.version) +
-				' "' +
-				latest.filename +
-				'"'
-		);
+			row.id +
+			' | ' +
+			row.name +
+			' | latest: v' +
+			String(latest.version) +
+			' "' +
+			latest.filename +
+			'"';
+		const indexed = (await indexRows('attachment', [latest.id])).get(latest.id);
+
+		if (indexed !== undefined && indexed.status === 'ready') {
+			line = line + ' | ' + indexed.description;
+		}
+
+		lines.push(line);
 	}
 
 	if (lines.length === 1) {
@@ -312,11 +338,13 @@ async function render(format: Format, parsed: ModelDocument): Promise<Buffer> {
 		return renderXlsx(parsed.sheets);
 	}
 
+	const branding = await readBranding();
+
 	if (format === 'docx') {
-		return renderDocx(parsed.markdown);
+		return renderDocx(parsed.markdown, branding);
 	}
 
-	return renderPdf(parsed.markdown);
+	return renderPdf(parsed.markdown, branding);
 }
 
 export function errorText(caught: unknown): string {
@@ -418,6 +446,36 @@ async function planSource(documentRow: DocumentRow, row: EmailRow): Promise<Plan
 	return plan;
 }
 
+/** A resource as the source of an edit: its ingested text, and a new file named after it. The original stays as it is. */
+async function planResource(userId: string, resourceId: string): Promise<Plan> {
+	const resourceRow = await getOwnedResource(userId, resourceId);
+
+	if (resourceRow === null) {
+		throw new Error('The planner asked for a resource that does not exist');
+	}
+
+	const text = await indexedText('resource', resourceRow.id);
+
+	if (text === null) {
+		throw new Error('"' + resourceRow.filename + '" has not been read yet');
+	}
+
+	let kind: WorkingKind = 'markdown';
+
+	if (SHEET_EXTENSIONS.includes(extensionOf(resourceRow.filename))) {
+		kind = 'sheets';
+	}
+
+	return {
+		documentRow: null,
+		kind,
+		sourceText: text,
+		sourceFile: null,
+		previousFilename: resourceRow.filename,
+		nextNumber: 2
+	};
+}
+
 function userMessage(
 	plan: Plan,
 	request: DocumentRequest,
@@ -468,8 +526,15 @@ export async function generateDocument(
 	row: EmailRow,
 	request: DocumentRequest,
 	background: string,
-	resourceFiles: ModelFile[] = []
+	resourceFiles: ModelFile[] = [],
+	options: { agent?: 'document' | 'financial'; userId?: string } = {}
 ): Promise<void> {
+	let agent: 'document' | 'financial' = 'document';
+
+	if (options.agent !== undefined) {
+		agent = options.agent;
+	}
+
 	const id = crypto.randomUUID();
 	const threadKey = row.threadId ?? row.id;
 	let documentRow: DocumentRow | null = null;
@@ -486,7 +551,20 @@ export async function generateDocument(
 			nextNumber: 1
 		};
 
-		if (request.documentId !== null) {
+		/** A new spreadsheet has no source to say so: the request does. */
+		if (request.spreadsheet && request.documentId === null && request.sourceResourceId === null) {
+			plan.kind = 'sheets';
+		}
+
+		if (request.sourceResourceId !== null) {
+			if (options.userId === undefined) {
+				throw new Error('A resource was asked for without an owner');
+			}
+
+			plan = await planResource(options.userId, request.sourceResourceId);
+			format = outputFormat(plan.previousFilename, false);
+			filename = nextFilename(plan.previousFilename ?? 'Document', plan.nextNumber, format);
+		} else if (request.documentId !== null) {
 			documentRow = await findDocument(draftRow.contactId, request.documentId);
 
 			if (documentRow === null) {
@@ -514,7 +592,7 @@ export async function generateDocument(
 
 		const raw = await recordAgentRun('document', row.id, () => {
 			return callModel(
-				'document',
+				agent,
 				[
 					{ role: 'system', content: systemPrompt(plan.kind) },
 					{ role: 'user', content: userMessage(plan, request, draftRow.body, background) }
@@ -525,9 +603,21 @@ export async function generateDocument(
 
 		const parsed = parseDocumentReply(raw, plan.kind);
 		format = outputFormat(plan.previousFilename, parsed.contract);
+		let sendAsPdf = false;
+
+		if (plan.kind === 'sheets') {
+			format = 'xlsx';
+		} else if (request.deliverAs !== null) {
+			/** Built as Word either way; "pdf" is converted when the reply is sent. */
+			format = 'docx';
+			sendAsPdf = request.deliverAs === 'pdf';
+		} else if (format === 'docx') {
+			/** The planner said nothing about the format: Word revisions still go out as a PDF. */
+			sendAsPdf = true;
+		}
 
 		if (plan.previousFilename === null) {
-			filename = cleanName(parsed.name) + '.' + format;
+			filename = cleanName(nameWithoutExtensions(parsed.name)) + '.' + format;
 		} else {
 			filename = nextFilename(plan.previousFilename, plan.nextNumber, format);
 		}
@@ -543,8 +633,13 @@ export async function generateDocument(
 
 		let changeNote = parsed.changeNote;
 
-		if (documentRow !== null) {
+		if (plan.previousFilename !== null) {
 			changeNote = (changeNote + '\n\n' + REBUILD_NOTE).trim();
+		}
+
+		/** ponytail: flagged in the note only; a "save as template" action can build on this later. */
+		if (request.missingTemplate !== null) {
+			changeNote = (changeNote + '\n\n' + NO_TEMPLATE_NOTE).trim();
 		}
 
 		const filePath = await generatedFilePath(threadKey, id, filename);
@@ -567,7 +662,8 @@ export async function generateDocument(
 			path: filePath,
 			sourcePath,
 			changeNote,
-			placeholders: listPlaceholders(source)
+			placeholders: listPlaceholders(source),
+			sendAsPdf
 		});
 	} catch (caught) {
 		console.error('Document generation failed:', caught);

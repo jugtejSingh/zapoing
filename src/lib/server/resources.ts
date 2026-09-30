@@ -1,138 +1,14 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { resource } from '$lib/server/db/schema';
 import type { ModelFile } from '$lib/server/ai/model';
 import { isReadableByAI } from '$lib/server/files/allowlist';
-import { indexResource } from '$lib/server/resourceIndex';
+import { forgetIndex, indexRows, queueIngest } from '$lib/server/fileIndex';
 import { MAX_ATTACHMENT_BYTES } from '$lib/server/smtp';
 import { resourceDir, resourceFilePath } from '$lib/server/storage/paths';
 
 export type ResourceRow = typeof resource.$inferSelect;
-
-/** At most this many resources go with one draft. */
-export const RESOURCE_LIMIT = 3;
-
-/** ponytail: caps the FTS query; a long email only adds noise past this. */
-const MAX_TERMS = 30;
-
-const STOPWORDS = new Set([
-	'about',
-	'above',
-	'after',
-	'again',
-	'all',
-	'also',
-	'and',
-	'any',
-	'are',
-	'because',
-	'been',
-	'before',
-	'being',
-	'below',
-	'best',
-	'between',
-	'both',
-	'but',
-	'can',
-	'could',
-	'dear',
-	'did',
-	'does',
-	'doing',
-	'down',
-	'during',
-	'each',
-	'few',
-	'for',
-	'from',
-	'further',
-	'get',
-	'had',
-	'has',
-	'have',
-	'having',
-	'hello',
-	'her',
-	'here',
-	'hers',
-	'him',
-	'his',
-	'how',
-	'into',
-	'its',
-	'just',
-	'kind',
-	'know',
-	'let',
-	'like',
-	'look',
-	'looking',
-	'many',
-	'may',
-	'more',
-	'most',
-	'much',
-	'must',
-	'need',
-	'not',
-	'now',
-	'off',
-	'once',
-	'only',
-	'other',
-	'our',
-	'ours',
-	'out',
-	'over',
-	'own',
-	'please',
-	'regards',
-	'same',
-	'send',
-	'sent',
-	'she',
-	'should',
-	'some',
-	'such',
-	'thank',
-	'thanks',
-	'than',
-	'that',
-	'the',
-	'their',
-	'them',
-	'then',
-	'there',
-	'these',
-	'they',
-	'this',
-	'those',
-	'through',
-	'too',
-	'under',
-	'until',
-	'very',
-	'want',
-	'was',
-	'way',
-	'were',
-	'what',
-	'when',
-	'where',
-	'which',
-	'while',
-	'who',
-	'whom',
-	'why',
-	'will',
-	'with',
-	'would',
-	'you',
-	'your',
-	'yours'
-]);
 
 /** Thrown for anything the user can fix: wrong file type, too big, empty name. */
 export class ResourceInputError extends Error {}
@@ -168,21 +44,6 @@ function cleanText(value: string, max: number): string {
 	return value.trim().slice(0, max);
 }
 
-/** "finance, pricing 2026" → ["finance", "pricing", "2026"], lower case, no repeats. */
-export function parseTags(value: string): string[] {
-	const tags: string[] = [];
-
-	for (const part of value.toLowerCase().split(/[\s,]+/)) {
-		const tag = part.trim().slice(0, 40);
-
-		if (tag.length > 0 && !tags.includes(tag)) {
-			tags.push(tag);
-		}
-	}
-
-	return tags.slice(0, 20);
-}
-
 async function saveFile(resourceId: string, file: File): Promise<string> {
 	const filePath = await resourceFilePath(resourceId, extensionOf(file.name));
 	await writeFile(filePath, Buffer.from(await file.arrayBuffer()));
@@ -191,7 +52,7 @@ async function saveFile(resourceId: string, file: File): Promise<string> {
 
 export async function createResource(
 	userId: string,
-	input: { name: string; keywords: string; tags: string; file: File }
+	input: { name: string; file: File }
 ): Promise<ResourceRow> {
 	const name = cleanText(input.name, 120);
 
@@ -209,15 +70,13 @@ export async function createResource(
 			id,
 			userId,
 			name,
-			keywords: cleanText(input.keywords, 1000),
-			tags: parseTags(input.tags),
 			filename: input.file.name,
 			contentType: input.file.type,
 			path: filePath
 		})
 		.returning();
 
-	await indexResource(id);
+	await queueIngest('resource', id);
 
 	return inserted[0];
 }
@@ -248,7 +107,7 @@ export async function getOwnedResource(userId: string, id: string): Promise<Reso
 export async function updateResource(
 	userId: string,
 	id: string,
-	input: { name: string; keywords: string; tags: string }
+	input: { name: string }
 ): Promise<boolean> {
 	const name = cleanText(input.name, 120);
 
@@ -258,7 +117,7 @@ export async function updateResource(
 
 	const updated = await db
 		.update(resource)
-		.set({ name, keywords: cleanText(input.keywords, 1000), tags: parseTags(input.tags) })
+		.set({ name })
 		.where(and(eq(resource.id, id), eq(resource.userId, userId)))
 		.returning({ id: resource.id });
 
@@ -285,12 +144,12 @@ export async function replaceResourceFile(
 		.update(resource)
 		.set({ filename: file.name, contentType: file.type, path: filePath, updatedAt: new Date() })
 		.where(eq(resource.id, row.id));
-	await indexResource(row.id);
+	await queueIngest('resource', row.id);
 
 	return true;
 }
 
-/** Removes the row (a trigger drops it from the search index) and its folder. */
+/** Removes the row, its index row and its folder. */
 export async function deleteResource(userId: string, id: string): Promise<boolean> {
 	const row = await getOwnedResource(userId, id);
 
@@ -299,85 +158,10 @@ export async function deleteResource(userId: string, id: string): Promise<boolea
 	}
 
 	await db.delete(resource).where(eq(resource.id, row.id));
+	await forgetIndex('resource', row.id);
 	await rm(resourceDir(row.id), { recursive: true, force: true });
 
 	return true;
-}
-
-/** Words worth searching for: lower case, 3+ letters, no common words, no repeats. */
-export function searchTerms(text: string): string[] {
-	const terms: string[] = [];
-
-	for (const word of text.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
-		if (word.length < 3 || STOPWORDS.has(word) || terms.includes(word)) {
-			continue;
-		}
-
-		terms.push(word);
-
-		if (terms.length >= MAX_TERMS) {
-			break;
-		}
-	}
-
-	return terms;
-}
-
-/**
- * An FTS5 query that matches any term, each as a quoted prefix ("price"*), so
- * no character in the email can be read as FTS syntax. Null when nothing is left.
- */
-export function ftsQuery(terms: string[]): string | null {
-	const parts: string[] = [];
-
-	for (const term of terms) {
-		parts.push('"' + term.replaceAll('"', '""') + '"*');
-	}
-
-	if (parts.length === 0) {
-		return null;
-	}
-
-	return parts.join(' OR ');
-}
-
-/**
- * The user's resources that best match the text, best first. Local only: FTS5
- * over name, keywords, tags and the file's text, ranked by bm25 with the name
- * weighted highest and the file's text lowest.
- */
-export async function searchResources(
-	userId: string,
-	text: string,
-	limit: number = RESOURCE_LIMIT
-): Promise<ResourceRow[]> {
-	const query = ftsQuery(searchTerms(text));
-
-	if (query === null) {
-		return [];
-	}
-
-	/** bm25 weights follow the column order: resource_id (unindexed), name, keywords, tags, content. */
-	const matches = db.all<{ id: string }>(sql`
-		SELECT resource.id AS id
-		FROM resource_fts
-		JOIN resource ON resource.id = resource_fts.resource_id
-		WHERE resource_fts MATCH ${query} AND resource.user_id = ${userId}
-		ORDER BY bm25(resource_fts, 0.0, 10.0, 5.0, 2.0, 1.0)
-		LIMIT ${limit}
-	`);
-
-	const rows: ResourceRow[] = [];
-
-	for (const match of matches) {
-		const row = await getOwnedResource(userId, match.id);
-
-		if (row !== null) {
-			rows.push(row);
-		}
-	}
-
-	return rows;
 }
 
 function newestFirst(rows: ResourceRow[]): ResourceRow[] {
@@ -388,8 +172,12 @@ function newestFirst(rows: ResourceRow[]): ResourceRow[] {
 	return sorted;
 }
 
-/** The [RESOURCES] section of the drafting context. */
-export function describeResources(rows: ResourceRow[]): string {
+/**
+ * The [RESOURCES] section the planner sees: every resource by id, name and
+ * description, newest first. The planner reads one with read_file, or hands it to
+ * a worker to change. Files that are not indexed yet are listed without a description.
+ */
+export async function describeResources(rows: ResourceRow[]): Promise<string> {
 	const lines: string[] = ['[RESOURCES]'];
 
 	if (rows.length === 0) {
@@ -398,18 +186,39 @@ export function describeResources(rows: ResourceRow[]): string {
 	}
 
 	lines.push(
-		'The user\'s reference files, attached to this message, newest first. Use them for facts like prices and terms. When they disagree, use the newest and add the disagreement to "conflicts".'
+		"The user's reference files. Read one with read_file before you rely on it. When two disagree, use the newest."
 	);
 
-	for (const row of newestFirst(rows)) {
-		let line = '- ' + row.name + ' (file ' + row.filename;
+	const ids: string[] = [];
 
-		if (row.tags.length > 0) {
-			line = line + ', tags: ' + row.tags.join(', ');
+	for (const row of rows) {
+		ids.push(row.id);
+	}
+
+	const index = await indexRows('resource', ids);
+
+	for (const row of newestFirst(rows)) {
+		let description = 'not read yet';
+		const indexed = index.get(row.id);
+
+		if (indexed !== undefined && indexed.status === 'ready') {
+			description = indexed.description;
+		} else if (indexed !== undefined && indexed.status === 'failed') {
+			description = 'could not be read';
 		}
 
-		line = line + ', updated ' + row.updatedAt.toISOString().slice(0, 10) + ')';
-		lines.push(line);
+		lines.push(
+			'- id: ' +
+				row.id +
+				' | ' +
+				row.name +
+				' | ' +
+				row.filename +
+				' | updated ' +
+				row.updatedAt.toISOString().slice(0, 10) +
+				' | ' +
+				description
+		);
 	}
 
 	return lines.join('\n');
@@ -432,15 +241,4 @@ export async function resourceFiles(rows: ResourceRow[]): Promise<ModelFile[]> {
 	}
 
 	return files;
-}
-
-/** What the draft keeps: names as they were, so deleting a resource later keeps the record. */
-export function usedResources(rows: ResourceRow[]): { id: string; name: string }[] {
-	const used: { id: string; name: string }[] = [];
-
-	for (const row of newestFirst(rows)) {
-		used.push({ id: row.id, name: row.name });
-	}
-
-	return used;
 }

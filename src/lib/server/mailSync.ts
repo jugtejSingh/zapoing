@@ -5,30 +5,22 @@ import { db } from '$lib/server/db';
 import { email, mailAccount } from '$lib/server/db/schema';
 import { generatedFoldersForEmails, removeFolders } from '$lib/server/files/generated';
 import {
-	categoryFromLabels,
 	createClient,
 	findSentMailbox,
 	makeSnippet,
 	toEmail
 } from '$lib/server/mail';
+import { yieldToEventLoop } from '$lib/server/eventLoop';
 import { getMailboxState, saveMailboxState, type MailboxState } from '$lib/server/mailboxState';
 import type { MailAccountCredentials } from '$lib/server/mailAccount';
 import { recordInsertedEmails } from '$lib/server/threads';
-import type { EmailCategory, EmailDirection } from '$lib/types';
+import type { EmailDirection } from '$lib/types';
 
 /** Rows written per insert. lastUid is saved after each, so a crash resumes here. */
 const BATCH_SIZE = 100;
 
 /** Ids per delete statement, to stay well under SQLite's parameter limit. */
 const DELETE_CHUNK_SIZE = 500;
-
-/**
- * Hands the event loop back between chunks of sync work, so a big backfill
- * doesn't run start-to-finish without ever letting a pending HTTP request in.
- */
-function yieldToEventLoop(): Promise<void> {
-	return new Promise((resolve) => setImmediate(resolve));
-}
 
 /** Milliseconds since `start`, for the timing logs below. */
 function elapsedMs(start: number): number {
@@ -140,15 +132,37 @@ async function deleteMissing(
 		onServer.add(uid);
 	}
 
+	/**
+	 * Only `uid` is selected so the query is answered from the email_unique index.
+	 * Selecting `id` too forces a scan of the whole table, and the rows carry their
+	 * full HTML, so that scan blocked the event loop for seconds.
+	 */
 	const localRows = await db
-		.select({ id: email.id, uid: email.uid })
+		.select({ uid: email.uid })
 		.from(email)
 		.where(and(eq(email.accountId, accountId), eq(email.mailbox, mailbox)));
 
-	const missingIds: string[] = [];
+	const missingUids: number[] = [];
 
 	for (const row of localRows) {
 		if (!onServer.has(row.uid)) {
+			missingUids.push(row.uid);
+		}
+	}
+
+	/** The ids are looked up only for the rows that are actually gone, usually none. */
+	const missingIds: string[] = [];
+
+	for (let chunkStart = 0; chunkStart < missingUids.length; chunkStart += DELETE_CHUNK_SIZE) {
+		const chunk = missingUids.slice(chunkStart, chunkStart + DELETE_CHUNK_SIZE);
+		const idRows = await db
+			.select({ id: email.id })
+			.from(email)
+			.where(
+				and(eq(email.accountId, accountId), eq(email.mailbox, mailbox), inArray(email.uid, chunk))
+			);
+
+		for (const row of idRows) {
 			missingIds.push(row.id);
 		}
 	}
@@ -276,7 +290,7 @@ async function fetchNewMessages(
 
 	for await (const message of client.fetch(
 		range,
-		{ uid: true, source: true, threadId: true, labels: true },
+		{ uid: true, source: true, threadId: true },
 		{ uid: true }
 	)) {
 		imapWaitMs += elapsedMs(waitStart);
@@ -294,12 +308,7 @@ async function fetchNewMessages(
 
 		const parseStart = Date.now();
 		const parsed = await simpleParser(message.source);
-		const parsedEmail = toEmail(
-			message.uid,
-			parsed,
-			message.threadId,
-			categoryFromLabels(message.labels)
-		);
+		const parsedEmail = toEmail(message.uid, parsed, message.threadId);
 		parseMs += elapsedMs(parseStart);
 
 		batch.push({
@@ -320,7 +329,6 @@ async function fetchNewMessages(
 			snippet: makeSnippet(parsedEmail.text),
 			threadId: parsedEmail.threadId,
 			attachments: parsedEmail.attachments,
-			category: parsedEmail.category,
 			direction
 		});
 
@@ -352,70 +360,10 @@ async function fetchNewMessages(
 }
 
 /**
- * Picks up Gmail moving stored messages between tabs, using CONDSTORE so only
- * flags of changed messages come back (no bodies).
- */
-async function refreshCategories(
-	client: ImapFlow,
-	accountId: string,
-	mailbox: string,
-	lastUid: number,
-	changedSince: bigint
-): Promise<void> {
-	const start = Date.now();
-	const updates: { uid: number; category: EmailCategory | null }[] = [];
-
-	for await (const message of client.fetch(
-		'1:' + String(lastUid),
-		{ uid: true, labels: true },
-		{ uid: true, changedSince }
-	)) {
-		/** Non-Gmail servers send no labels, so there is nothing to update. */
-		if (!message.labels) {
-			continue;
-		}
-
-		updates.push({ uid: message.uid, category: categoryFromLabels(message.labels) });
-	}
-
-	console.log(
-		'[mailSync] ' +
-			mailbox +
-			': fetched ' +
-			updates.length +
-			' changed categories in ' +
-			elapsedMs(start) +
-			'ms'
-	);
-
-	const updateStart = Date.now();
-
-	for (const update of updates) {
-		await db
-			.update(email)
-			.set({ category: update.category })
-			.where(
-				and(eq(email.accountId, accountId), eq(email.mailbox, mailbox), eq(email.uid, update.uid))
-			);
-	}
-
-	console.log(
-		'[mailSync] ' +
-			mailbox +
-			': wrote ' +
-			updates.length +
-			' category updates in ' +
-			elapsedMs(updateStart) +
-			'ms'
-	);
-}
-
-/**
  * Brings one folder up to date:
  * 1. a UIDVALIDITY change (or first sync) drops rows from other generations
  * 2. everything after lastUid is fetched — the whole folder on the first run
  * 3. rows the server no longer has are deleted, only if the uid search succeeded
- * 4. Gmail category changes since the last run are applied
  * The final state (with the new modseq) is saved only once all of that worked.
  */
 export async function syncMailbox(
@@ -488,15 +436,6 @@ export async function syncMailbox(
 
 		if (opened.highestModseq !== undefined && !opened.noModseq) {
 			serverModseq = opened.highestModseq;
-		}
-
-		if (
-			state.highestModseq !== null &&
-			serverModseq !== null &&
-			serverModseq > state.highestModseq &&
-			state.lastUid > 0
-		) {
-			await refreshCategories(client, accountId, mailbox, state.lastUid, state.highestModseq);
 		}
 
 		await saveMailboxState(accountId, mailbox, {

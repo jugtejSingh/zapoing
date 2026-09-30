@@ -2,8 +2,6 @@
 	import { untrack } from 'svelte';
 	import { invalidate } from '$app/navigation';
 	import * as Sidebar from '$lib/components/ui/sidebar/index.js';
-	import { Separator } from '$lib/components/ui/separator/index.js';
-	import * as Breadcrumb from '$lib/components/ui/breadcrumb/index.js';
 	import AppSidebar from '$lib/components/app-sidebar.svelte';
 	import MailAccountDialog from '$lib/components/MailAccountDialog.svelte';
 	import type { LayoutData } from './$types';
@@ -33,12 +31,13 @@
 			delay = 3_000;
 		}
 
-		const timer = setInterval(() => {
-			invalidate('app:inbox');
-		}, delay);
+		// PAUSED: inbox polling off (each tick re-ran the slow thread query).
+		// const timer = setInterval(() => {
+		// 	invalidate('app:inbox');
+		// }, delay);
 
 		return () => {
-			clearInterval(timer);
+			// clearInterval(timer);
 		};
 	});
 </script>
@@ -47,36 +46,19 @@
 	<title>Inbox · Zapoing</title>
 </svelte:head>
 
-<Sidebar.Provider style="--sidebar-width: 440px;">
+<Sidebar.Provider style="--sidebar-width: 480px;">
 	<AppSidebar
 		threads={data.threads}
 		hasMoreThreads={data.hasMoreThreads}
 		accounts={data.accounts}
 		user={data.user}
 		mailError={data.mailError}
-		category={data.category}
 		draftsOnly={data.draftsOnly}
 		syncStatuses={data.syncStatuses}
 		onOpenSettings={openSettings}
 	/>
 
 	<Sidebar.Inset>
-		<header class="bg-background sticky top-0 flex shrink-0 items-center gap-2 border-b p-4">
-			<Sidebar.Trigger class="-ms-1" />
-			<Separator orientation="vertical" class="me-2 data-[orientation=vertical]:h-4" />
-			<Breadcrumb.Root>
-				<Breadcrumb.List>
-					<Breadcrumb.Item class="hidden md:block">
-						<Breadcrumb.Link href="/home">All Inboxes</Breadcrumb.Link>
-					</Breadcrumb.Item>
-					<Breadcrumb.Separator class="hidden md:block" />
-					<Breadcrumb.Item>
-						<Breadcrumb.Page>Inbox</Breadcrumb.Page>
-					</Breadcrumb.Item>
-				</Breadcrumb.List>
-			</Breadcrumb.Root>
-		</header>
-
 		<div class="flex flex-1 flex-col overflow-hidden">
 			{@render children()}
 		</div>

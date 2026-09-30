@@ -3,19 +3,8 @@ import { listMailAccounts } from '$lib/server/mailAccount';
 import { listCachedThreads } from '$lib/server/mailCache';
 import { getSyncStatuses } from '$lib/server/syncWorker';
 import { listTrackedPeople } from '$lib/server/trackedPerson';
-import type { EmailCategory, SyncStatus, ThreadSummary } from '$lib/types';
+import type { SyncStatus, ThreadSummary } from '$lib/types';
 import type { LayoutServerLoad } from './$types';
-
-const CATEGORIES: EmailCategory[] = ['promotions', 'social', 'updates', 'forums'];
-
-/** The `?category=` param, or null for the primary inbox (the default). */
-function categoryFromParam(value: string | null): EmailCategory | null {
-	if (value !== null && (CATEGORIES as string[]).includes(value)) {
-		return value as EmailCategory;
-	}
-
-	return null;
-}
 
 /**
  * The list pane: the combined inbox across every account. Lives in the layout
@@ -34,8 +23,7 @@ export const load: LayoutServerLoad = async (event) => {
 	const accounts = await listMailAccounts(userId);
 	const trackedPeople = await listTrackedPeople(userId);
 
-	const category = categoryFromParam(event.url.searchParams.get('category'));
-	/** `?drafts=1`: only threads with a draft waiting, across every category. */
+	/** `?drafts=1`: only threads with a draft waiting. */
 	const draftsOnly = event.url.searchParams.get('drafts') === '1';
 
 	const accountIds = new Set<string>();
@@ -63,7 +51,7 @@ export const load: LayoutServerLoad = async (event) => {
 	let hasMoreThreads = false;
 
 	if (accounts.length > 0) {
-		const page = await listCachedThreads(userId, category, draftsOnly);
+		const page = await listCachedThreads(userId, draftsOnly);
 		threads = page.threads;
 		hasMoreThreads = page.hasMore;
 	}
@@ -73,7 +61,6 @@ export const load: LayoutServerLoad = async (event) => {
 		trackedPeople,
 		threads,
 		hasMoreThreads,
-		category,
 		draftsOnly,
 		mailError,
 		syncStatuses,

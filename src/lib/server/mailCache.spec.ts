@@ -47,7 +47,6 @@ beforeEach(async () => {
 		subject: 'Contract',
 		date: new Date('2026-03-01T10:00:00Z'),
 		threadId: 'thread-contract',
-		labels: ['\\Inbox']
 	});
 	deliver(workSent, {
 		subject: 'Re: Contract',
@@ -59,13 +58,11 @@ beforeEach(async () => {
 		subject: 'Re: Contract',
 		date: new Date('2026-03-01T12:00:00Z'),
 		threadId: 'thread-contract',
-		labels: ['\\Inbox']
 	});
 	deliver(workInbox, {
 		subject: 'Sale',
 		date: new Date('2026-03-02T09:00:00Z'),
 		threadId: 'thread-sale',
-		labels: ['\\CategoryPromotions']
 	});
 
 	const personalServer = createFakeServer('me@example.com');
@@ -75,13 +72,11 @@ beforeEach(async () => {
 		subject: 'Dinner',
 		date: new Date('2026-03-03T18:00:00Z'),
 		threadId: 'thread-dinner',
-		labels: ['\\Inbox']
 	});
 	deliver(personalInbox, {
 		subject: 'New reply in your topic',
 		date: new Date('2026-03-04T08:00:00Z'),
 		threadId: 'thread-forum',
-		labels: ['\\CategoryForums']
 	});
 
 	await syncAccount(work);
@@ -89,8 +84,8 @@ beforeEach(async () => {
 });
 
 describe('listCachedThreads', () => {
-	it('combines every account into one primary inbox, newest first', async () => {
-		const { threads } = await listCachedThreads('user-1', null);
+	it('combines every account into one inbox, newest first', async () => {
+		const { threads } = await listCachedThreads('user-1');
 
 		const summary: string[] = [];
 
@@ -100,33 +95,47 @@ describe('listCachedThreads', () => {
 			);
 		}
 
-		/** Sent replies stay out of the list, so the contract thread counts its two received messages. */
-		expect(summary).toEqual(['me@example.com: Dinner x1', 'Work: Re: Contract x2']);
+		/** The contract thread is one row, headed by its newest received message, counting the sent reply too. */
+		expect(summary).toEqual([
+			'me@example.com: New reply in your topic x1',
+			'me@example.com: Dinner x1',
+			'Work: Sale x1',
+			'Work: Re: Contract x3'
+		]);
 	});
 
-	it('shows each tab only its own category, across accounts', async () => {
-		const promotions = (await listCachedThreads('user-1', 'promotions')).threads;
-		expect(promotions).toHaveLength(1);
-		expect(promotions[0].subject).toBe('Sale');
-		expect(promotions[0].accountId).toBe(work.id);
+	it('paginates in threads, not messages', async () => {
+		const first = await listCachedThreads('user-1', false, 1, 0);
+		expect(first.threads.map((thread) => thread.subject)).toEqual(['New reply in your topic']);
+		expect(first.hasMore).toBe(true);
 
-		const forums = (await listCachedThreads('user-1', 'forums')).threads;
-		expect(forums).toHaveLength(1);
-		expect(forums[0].accountId).toBe(personal.id);
+		const last = await listCachedThreads('user-1', false, 1, 3);
+		expect(last.threads.map((thread) => thread.subject)).toEqual(['Re: Contract']);
+		expect(last.threads[0].messageCount).toBe(3);
+	});
 
-		expect((await listCachedThreads('user-1', 'social')).threads).toEqual([]);
+	it('searches sender and subject across the whole mailbox and treats % literally', async () => {
+		const bySubject = await listCachedThreads('user-1', false, 20, 0, 'sale');
+		expect(bySubject.threads.map((thread) => thread.subject)).toEqual(['Sale']);
+
+		const wildcard = await listCachedThreads('user-1', false, 20, 0, '%');
+		expect(wildcard.threads).toEqual([]);
+
+		const contract = await listCachedThreads('user-1', false, 20, 0, 'contract');
+		expect(contract.threads).toHaveLength(1);
+		expect(contract.threads[0].messageCount).toBe(3);
 	});
 
 	it('shows nothing to another user', async () => {
 		await createTestUser('user-2');
 
-		expect((await listCachedThreads('user-2', null)).threads).toEqual([]);
+		expect((await listCachedThreads('user-2')).threads).toEqual([]);
 	});
 });
 
 describe('getCachedThread', () => {
 	it('returns the whole thread, including the reply sent from this account, oldest first', async () => {
-		const { threads } = await listCachedThreads('user-1', null);
+		const { threads } = await listCachedThreads('user-1');
 		let contractId = '';
 
 		for (const thread of threads) {
@@ -148,7 +157,7 @@ describe('getCachedThread', () => {
 
 	it("refuses another user's email id", async () => {
 		await createTestUser('user-2');
-		const { threads } = await listCachedThreads('user-1', null);
+		const { threads } = await listCachedThreads('user-1');
 
 		expect(await getCachedThread('user-2', threads[0].id)).toEqual([]);
 	});

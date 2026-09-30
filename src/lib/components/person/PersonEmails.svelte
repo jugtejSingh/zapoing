@@ -34,6 +34,13 @@
 			);
 			const page: PersonEmailPage = await response.json();
 
+			/** JSON turns dates into strings, but formatDate expects Date objects. */
+			for (const message of page.emails) {
+				if (message.date !== null) {
+					message.date = new Date(message.date);
+				}
+			}
+
 			loadedEmails = [...loadedEmails, ...page.emails];
 			hasMore = page.hasMore;
 		} finally {
